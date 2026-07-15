@@ -460,7 +460,7 @@ cd RevealKeys
 go mod tidy
 
 # Build from the main source file
-go build -o revealkeys mantra_v1.0_complete.go
+go build -o revealkeys main.go
 
 # Test your changes
 go test ./...
