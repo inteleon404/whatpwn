@@ -1,3 +1,3 @@
-module github.com/INTELEON404/RevealKeys
+module github.com/inteleon404/whatpwn
 
 go 1.21.1
