@@ -1,635 +1,342 @@
-<div align="center">
-  <img src="https://i.ibb.co.com/tpmH3RSn/REVEALKEYS.png" alt="RevealKeys Logo" />
+<p align="center">
+<img width="290" height="58" alt="ascii-art-text" src="https://github.com/user-attachments/assets/f3694657-cd52-4292-a9cf-0e98295c9b05" />
 
-  <p align="center">
-    <img src="https://img.shields.io/badge/Version-1.1-brightgreen.svg" alt="Version">
-    <img src="https://img.shields.io/badge/Go-1.19+-blue.svg" alt="Go Version">
-    <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
-    <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg" alt="Platform">
-  </p>
 
-  <p align="center">
-    <strong>Scan code to detect exposed API keys, tokens, and secrets</strong>
-  </p>
+<p align="center">
+  <img src="https://img.shields.io/badge/Version-1.1.2-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/Go-1.19+-blue.svg" alt="Go Version">
+  <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg" alt="Platform">
+</p>
 
-  <p align="center">
-    A powerful, fast, and accurate tool for detecting exposed secrets, API keys, tokens, and credentials in web applications.
-  </p>
-</div>
+<p align="center">
+  <strong>Advanced Credentials & Secrets Disclosure Hunter</strong>
+</p>
+
+<p align="center">
+  A fast, accurate command-line tool for detecting exposed API keys, tokens,
+  and credentials across live URLs and web applications.
+</p>
 
 ---
 
-## 🎯 Features
+## Features
 
 ### Core Capabilities
-- 🔍 **Smart Detection** - Entropy-based analysis with multi-layer validation
-- 🎨 **Beautiful UI** - Color-coded severity levels with professional terminal output
-- ⚡ **High Performance** - Concurrent scanning with 3-4x faster than traditional tools
-- 🎯 **Low False Positives** - Advanced filtering reduces FPs from 60-70% to <15%
-- 📊 **Real-Time Statistics** - Live progress tracking and performance metrics
-- 🔧 **Highly Configurable** - Customizable entropy thresholds and detection patterns
+
+- Structured and keyword-based detection across 350+ patterns
+- Multi-layer false-positive filtering (deny lists, entropy, repeated-character checks)
+- Concurrent scanning with configurable thread count
+- Plain-text and JSON Lines output
+- Custom headers, proxy support, and configurable retries/timeouts
+- Extendable via a user-supplied regex file
 
 ### Detection Categories
-- ✅ AWS Access Keys & Secret Keys
-- ✅ GitHub Personal Access Tokens (all types)
-- ✅ Google API Keys & OAuth Tokens
-- ✅ Stripe Live & Test Keys
-- ✅ Slack Tokens & Webhooks
-- ✅ SendGrid API Keys
-- ✅ NPM Access Tokens
-- ✅ JWT Tokens
-- ✅ Private Keys (RSA, OpenSSH, etc.)
-- ✅ Database Connection Strings
-- ✅ 1000+ Additional Patterns
+
+- AWS, Azure, and Google Cloud credentials
+- GitHub, GitLab, and Bitbucket tokens
+- Stripe, PayPal, Square, and Razorpay keys
+- Slack, Discord, Telegram, and Microsoft Teams tokens/webhooks
+- SendGrid, Mailgun, Mailchimp, and other email service keys
+- OpenAI, Anthropic, HuggingFace, and other AI provider keys
+- JWTs, private keys, SSH keys, and OAuth secrets
+- Database connection strings (MySQL, PostgreSQL, MongoDB, Redis, and more)
+- DevOps and infrastructure tokens (Docker, Kubernetes, Terraform, CI/CD)
+- PII patterns and generic credential assignments
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ### Prerequisites
+
 - Go 1.19 or higher
-- Unix-like system (Linux, macOS) or Windows with Go support
+- Linux, macOS, or Windows with Go support
 
-### Quick Installation
-```
-github.com/INTELEON404/RevealKeys@latest
-```
+### Quick Install
 
-#### Download from Release (Recommended)
 ```bash
-# Download the latest release
-wget https://github.com/INTELEON404/RevealKeys/releases/download/v1.1/RevealKeys.zip
-
-# Extract and install
-unzip RevealKeys.zip
-cd RevealKeys
-chmod +x revealkeys
-sudo mv revealkeys /usr/local/bin/
+go install github.com/inteleon404/whatpwn@latest
 ```
 
-#### Build from Source
+### Build From Source
+
 ```bash
-# Clone the repository
-git clone https://github.com/INTELEON404/RevealKeys.git
-cd RevealKeys
-
-# Build the tool (build from the correct file)
-go build -o revealkeys main.go
-
-# Make it executable
-chmod +x revealkeys
-
-# Optional: Install globally
-sudo mv revealkeys /usr/local/bin/
+git clone https://github.com/inteleon404/whatpwn.git
+cd whatpwn
+go build -o whatpwn main.go
+chmod +x whatpwn
+sudo mv whatpwn /usr/local/bin/
 ```
 
-#### One-Liner Install
+### One-Liner Install
+
 ```bash
-git clone https://github.com/INTELEON404/RevealKeys.git && \
-cd RevealKeys && \
-go build -o revealkeys main.go && \
-chmod +x revealkeys && \
-echo "Installation complete! Run with: ./revealkeys -h"
+git clone https://github.com/inteleon404/whatpwn.git && \
+cd whatpwn && \
+go build -o whatpwn main.go && \
+chmod +x whatpwn && \
+echo "Installation complete. Run with: ./whatpwn -h"
 ```
 
-#### Windows Installation
+### Windows
+
 ```powershell
-# Using Git Bash or WSL
-git clone https://github.com/INTELEON404/RevealKeys.git
-cd RevealKeys
-go build -o revealkeys.exe main.go
+git clone https://github.com/inteleon404/whatpwn.git
+cd whatpwn
+go build -o whatpwn.exe main.go
 ```
 
 ---
 
-## 📖 Usage
+## Usage
 
-### Basic Usage
+### Basic
 
 ```bash
 # Scan URLs from stdin
-cat urls.txt | ./revealkeys
+cat urls.txt | ./whatpwn
 
-# Scan with pipe from other tools
-waybackurls target.com | ./revealkeys
+# Scan with pipe from other recon tools
+waybackurls target.com | ./whatpwn
 
-# With custom threads
-cat urls.txt | ./revealkeys -t 100
+# Scan a list of URLs from a file
+./whatpwn -l urls.txt
 
-# Detailed output
-cat urls.txt | ./revealkeys -d
+# Increase concurrency
+cat urls.txt | ./whatpwn -t 100
 
-# Silent mode (only results)
-cat urls.txt | ./revealkeys -s
+# Silent mode (findings only, no banner/summary)
+cat urls.txt | ./whatpwn -silent
 ```
 
 ### Command Line Options
 
-```bash
-Usage: revealkeys [OPTIONS]
+```
+USAGE:
+  whatpwn [flags]
 
-Options:
-  -s              Silent mode (no banner/statistics)
-  -t int          Number of concurrent threads (default: 50)
-  -d              Detailed output with full information
-  -ua string      Custom User-Agent header (default: "Mantra/1.0 Security Scanner")
-  -c string       Cookie header for authenticated scanning
-  -ep string      Extra custom regex pattern for detection
-  -me float       Minimum entropy threshold 0-8 (default: 3.5)
-  -ne             Disable entropy checking (more results, more false positives)
+INPUT:
+  -l string            stdin (default) or a file with a list of URLs/hosts
 
-Examples:
-  ./revealkeys -t 100 -me 3.5 < urls.txt
-  ./revealkeys -d -t 50 < target_urls.txt
-  ./revealkeys -s -me 5.0 < high_confidence.txt
-  ./revealkeys -ne -t 200 < maximum_coverage.txt
+OUTPUT:
+  -o string             write findings to file
+  -json string          write findings as JSON lines
+  -nc                    disable color output
+  -silent                silent mode, no banner/summary
+  -stats                 show detailed scan statistics
+
+CONFIG:
+  -t int                 concurrent threads (default 25)
+  -timeout int           request timeout in seconds (default 15)
+  -retry int             retry count on failure (default 1)
+  -ua string             custom user-agent
+  -H string              custom header, e.g. 'Cookie: session=abc'
+  -proxy string          http proxy, e.g. http://127.0.0.1:8080
+  -verify                verify TLS certificates
+
+FILTER:
+  -e string              extra regex file, one pattern per line
+  -entropy               entropy-filter keyword matches
+  -min-entropy float     minimum shannon entropy (default 3.2)
+  -max-body int          max response body size to scan, in MB (default 5)
+  -mm int                max matches per pattern per page (default 5)
 ```
 
 ---
 
-## 🎨 Output Examples
+## Output Example
 
-### Standard Output
+```
+▓ ▄  ▓ █▄▄▄  ▀▀▓ █▄▄  █▀▀▓ ▓ ▄  ▓ ▓▀▀█
+█ █ ▄█ █  █ █▀▀█ █  ▄ █  █ █ █ ▄█ █  █
+▓▄█▄█  █  ▓ ▓▄▄▓ █▄▄▓ ▓▀▀▀ ▓▄█▄█  █  ▓
+
+  WhatPwn v1.1.2 | Advanced Credentials & Secrets Disclosure Hunter
+  356 patterns loaded | threads: 25 | timeout: 15s
+  ────────────────────────────────────────────────────────
+
+[+] https://site.com/app.js [AKIAIOSFODNN7EXAMPLE]
+[+] https://site.com/config.js [ghp_1234567890abcdefghijklmnopqrstuvwxyz]
+[+] https://site.com/api.js [sk_live_4eC39HqLyjWDarjtT1zdp7dc]
+
+[+] Scan Complete in 12.4s
+[+] URLs: 245 | Findings: 3 | Skipped: 0
 ```
 
-    Developer: INTELEON404
-    Version: 1.0 
+With `-stats`:
 
-────────────────────────────────────────────────────────────────────
-    Config: Threads=50 | Entropy=3.5 | EntropyCheck=true
-────────────────────────────────────────────────────────────────────
-
-[+] https://site.com/app.js [AKIAIOSFODNN7EXAMPLE] [AWS Access Key ID] [CRITICAL]
-[+] https://site.com/config.js [ghp_abc123...xyz789] [GitHub Personal Token] [CRITICAL]
-[+] https://site.com/api.js [sk_live_4eC39Hq...] [Stripe Live Secret] [CRITICAL]
-
-═══════════════════════════════════════════════════════════════════
-                        SCAN COMPLETE
-═══════════════════════════════════════════════════════════════════
-  URLs Processed: 245
-  Secrets Found:  3
-  Time Elapsed:   45s
-  Avg Speed:      5.44 URLs/sec
-═══════════════════════════════════════════════════════════════════
 ```
-
-### Detailed Output (-d flag)
-```
-[*] Processing: https://site.com/app.js
-[+] https://site.com/app.js
-    Secret: AKIAIOSFODNN7EXAMPLE123ABC
-    Type: AWS Access Key ID
-    Category: AWS
-    Severity: CRITICAL
-    Line: 42
+[+] Requests: 245 | Data: 18.2 MB | Patterns: 356
 ```
 
 ---
 
-## 🔥 Real-World Examples
+## Real-World Examples
 
 ### Bug Bounty Hunting
 
-#### Discover JavaScript files and scan for secrets
 ```bash
-waybackurls target.com | grep -E '\.(js|json)$' | ./revealkeys -t 100
-```
+# Discover JavaScript files and scan for secrets
+waybackurls target.com | grep -E '\.(js|json)$' | ./whatpwn -t 100
 
-#### Combine with gau for comprehensive coverage
-```bash
-gau target.com | ./revealkeys -me 3.5 -t 100 > findings.txt
-```
+# Combine with gau for broader coverage
+gau target.com | ./whatpwn -t 100 -o findings.txt
 
-#### Filter only critical findings
-```bash
-cat urls.txt | ./revealkeys | grep "CRITICAL" > critical_secrets.txt
+# Save findings as JSON for further processing
+cat urls.txt | ./whatpwn -json findings.json -silent
 ```
 
 ### Penetration Testing
 
-#### Detailed scan with documentation
 ```bash
-cat scope.txt | ./revealkeys -d -t 50 > pentest_report.txt
-```
+# Scan with detailed statistics
+./whatpwn -l scope.txt -t 50 -stats
 
-#### Scan with custom cookies for authenticated areas
-```bash
-cat authenticated_urls.txt | ./revealkeys -c "session=abc123" -d
+# Authenticated scanning with a session cookie
+./whatpwn -l authenticated_urls.txt -H "Cookie: session=abc123"
 ```
 
 ### Red Team Operations
 
-#### Silent, high-confidence only
 ```bash
-cat targets.txt | ./revealkeys -s -me 5.0 -t 200 > high_value_secrets.txt
-```
+# Silent, stricter entropy filtering
+./whatpwn -l targets.txt -silent -entropy -min-entropy 4.5 -t 200
 
-#### Fast recon mode
-```bash
-echo "https://target.com" | hakrawler | ./revealkeys -s
+# Fast recon pipeline
+echo "https://target.com" | hakrawler | ./whatpwn -silent
 ```
 
 ### CI/CD Integration
 
-#### Fail pipeline on secret detection
 ```bash
-git diff main | ./revealkeys -s -me 5.0
-if [ $? -eq 0 ]; then echo "❌ Secrets detected!" && exit 1; fi
-```
-
-#### Pre-commit hook
-```bash
-cat changed_files.txt | ./revealkeys -s -me 4.5 || exit 1
+# Scan a diff before merging
+git diff main | ./whatpwn -silent -entropy -min-entropy 4.5
 ```
 
 ---
 
-## 🎯 Severity Levels
-
-| Level | Color | Examples | Action |
-|-------|-------|----------|--------|
-| **CRITICAL** | 🔴 Red | AWS Keys, Private Keys, Stripe Live | Immediate action required |
-| **HIGH** | 🟡 Yellow | Google API, Slack, SendGrid | High priority review |
-| **MEDIUM** | 🔵 Cyan | JWT, Generic tokens | Review recommended |
-| **CUSTOM** | 🟣 Magenta | User-defined patterns | Based on context |
-
----
-
-## ⚙️ Configuration Guide
-
-### Entropy Threshold Tuning
+## Integration Examples
 
 ```bash
-# Very Strict (minimal false positives, may miss some secrets)
-./revealkeys -me 5.0
+# With waybackurls
+waybackurls target.com | ./whatpwn -t 100 -o secrets.txt
 
-# Strict (recommended for production/CI/CD)
-./revealkeys -me 4.0
+# With gau
+gau target.com | ./whatpwn -o findings.txt
 
-# Balanced (default, best for most use cases)
-./revealkeys -me 3.5
+# With hakrawler
+echo "target.com" | hakrawler | ./whatpwn -stats
 
-# Relaxed (more coverage, some false positives)
-./revealkeys -me 2.5
+# With gospider
+gospider -s https://target.com --js | ./whatpwn
 
-# Maximum Coverage (disable entropy check)
-./revealkeys -ne
-```
+# With subfinder + httpx
+subfinder -d target.com | httpx -silent | ./whatpwn -t 100
 
-### Thread Optimization
-
-#### Resource-constrained environments
-```bash
-./revealkeys -t 10
-```
-
-#### Balanced (default)
-```bash
-./revealkeys -t 50
-```
-
-#### High-speed scanning
-```bash
-./revealkeys -t 100
-```
-
-#### Maximum speed (high resource usage)
-```bash
-./revealkeys -t 200
-```
-
----
-
-## 📊 Performance Benchmarks
-
-| Configuration | URLs/sec | Memory | Accuracy | Use Case |
-|--------------|----------|--------|----------|----------|
-| `-t 10 -me 4.0` | 2-3 | ~30MB | 95%+ | CI/CD, Strict |
-| `-t 50 -me 3.5` | 8-12 | ~45MB | 90%+ | General Use |
-| `-t 100 -me 3.0` | 15-20 | ~60MB | 85%+ | Bug Bounty |
-| `-t 200 -ne` | 25-35 | ~90MB | 75%+ | Maximum Coverage |
-
-### Comparison with Original Version
-
-| Metric | Original | RevealKeys | Improvement |
-|--------|----------|------------|-------------|
-| False Positives | 60-70% | <15% | **-77%** |
-| True Positives | 18-25% | 85-95% | **+300%** |
-| Speed | 450-500ms | 120-150ms | **3-4x faster** |
-| Memory Usage | 250MB | 45-60MB | **-76%** |
-
----
-
-## 🛠️ Integration Examples
-
-### With Waybackurls
-```bash
-waybackurls target.com | ./revealkeys -t 100 > secrets.txt
-```
-
-### With Gau (Get All URLs)
-```bash
-gau target.com | ./revealkeys -me 3.5 > findings.txt
-```
-
-### With Hakrawler
-```bash
-echo "target.com" | hakrawler | ./revealkeys -d
-```
-
-### With Gospider
-```bash
-gospider -s https://target.com --js | ./revealkeys
-```
-
-### With Subfinder + HTTPx
-```bash
-subfinder -d target.com | httpx -silent | ./revealkeys -t 100
-```
-
-### Pipeline Example
-```bash
-# Complete recon to report pipeline
+# Full recon-to-report pipeline
 subfinder -d target.com -silent | \
   httpx -silent | \
   waybackurls | \
   grep -E '\.(js|json)$' | \
   sort -u | \
-  ./revealkeys -t 100 -me 3.5 | \
-  tee scan_results_$(date +%Y%m%d).txt | \
-  grep "CRITICAL" > critical_findings.txt
+  ./whatpwn -t 100 -json results.json
 ```
 
 ---
 
-## 🔍 What Gets Detected
+## Detection Behavior
 
-### ✅ WILL DETECT (True Positives)
+### Will Detect
 
-```JavaScript
-// AWS Credentials
+```javascript
 const awsAccessKey = "AKIAIOSFODNN7EXAMPLE123";
-const awsSecret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-
-// GitHub Tokens
-const githubPAT = "ghp_1234567890abcdefghijklmnopqrstuvwxyz";
-const githubOAuth = "gho_1234567890abcdefghijklmnopqrstuvwxyz";
-
-// API Keys
-const stripeKey = "sk_live_4eC39HqLyjWDarjtT1zdp7dc";
-const googleAPI = "AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe";
-const slackToken = "xoxb-123456789012-123456789012-abc123def456";
-
-// Private Keys
-const privateKey = "-----BEGIN RSA PRIVATE KEY-----\nMIIE...";
-
-// JWT Tokens
-const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWI...";
+const githubPAT    = "ghp_1234567890abcdefghijklmnopqrstuvwxyz";
+const stripeKey    = "sk_live_4eC39HqLyjWDarjtT1zdp7dc";
+const slackToken   = "xoxb-123456789012-123456789012-abc123def456";
+const privateKey   = "-----BEGIN RSA PRIVATE KEY-----";
+const jwt          = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWI...";
 ```
 
-### ❌ WILL NOT DETECT (False Positives Filtered)
+### Will Not Detect (filtered as false positives)
 
-```JavaScript
-// Placeholders
-const apiKey = "your_api_key_here";
-const token = "replace_with_your_token";
-
-// Common words
-const password = "example123";
-const secret = "test_secret";
-
-// Low entropy
-const key = "12345678";
-const value = "aaaaaaaaaaa";
-
-// Too short
-const id = "abc";
+```javascript
+const apiKey      = "your_api_key_here";
+const token       = "replace_with_your_token";
+const password    = "changeme";
+const secret      = "test_secret";
+const key         = "12345678";
+const placeholder = "xxxxxxxxxx";
 ```
+
+False positives are filtered through an exact-match deny list, placeholder
+word matching, digit-only and HTML-fragment checks, repeated-character
+detection, and optional Shannon entropy scoring (`-entropy`).
 
 ---
 
-## 🧪 Testing
-
-### Test with Sample Data
+## Testing
 
 ```bash
-# Create test file with sample secrets
-cat > test.txt << 'EOF'
-https://example.com/app.js
-https://example.com/config.js
-EOF
-
-# Create a test JavaScript file with secrets
+# Create a sample file with test secrets
 cat > test.js << 'EOF'
-// Test secrets
 const awsKey = "AKIAIOSFODNN7EXAMPLE123";
 const githubToken = "ghp_1234567890abcdefghijklmnopqrstuvwxyz";
 const stripeKey = "sk_live_4eC39HqLyjWDarjtT1zdp7dc";
 const placeholder = "your_key_here";
 EOF
 
-# Run test scan
-echo "file://$(pwd)/test.js" | ./revealkeys -d
+# Serve or host the file, then scan it
+echo "https://example.com/test.js" | ./whatpwn
 ```
 
-### Validate Installation
+---
+
+## Contributing
+
+Contributions are welcome. Please open a pull request or an issue describing
+the change.
 
 ```bash
-# Check help
-./revealkeys -h
-
-# Test with known secret
-echo 'const key="AKIAIOSFODNN7EXAMPLE123";' > test.html
-echo "file://$(pwd)/test.html" | ./revealkeys
+git clone https://github.com/inteleon404/whatpwn.git
+cd whatpwn
+go build -o whatpwn main.go
+go vet ./...
 ```
 
----
-
-## 🤝 Contributing
-
-We welcome contributions! Please feel free to submit a Pull Request.
-
-### Development Setup
-
-```bash
-# Clone the repository
-git clone https://github.com/INTELEON404/RevealKeys.git
-cd RevealKeys
-
-# Install dependencies
-go mod tidy
-
-# Build from the main source file
-go build -o revealkeys main.go
-
-# Test your changes
-go test ./...
-```
-
-### Reporting Issues
-
-Please report issues on our [GitHub Issues](https://github.com/INTELEON404/RevealKeys/issues) page. Include:
-- Detailed description
-- Steps to reproduce
-- Expected vs actual behavior
-- Screenshots if applicable
+When reporting issues, include a clear description, steps to reproduce, and
+expected versus actual behavior.
 
 ---
 
-## 🔐 Security & Ethics
+## Security and Ethics
 
-### Legal Notice
+This tool is intended for authorized security research and testing only.
 
-⚠️ **IMPORTANT**: This tool is for security research and authorized testing only.
+- Obtain proper authorization before scanning any target
+- Follow responsible disclosure practices
+- Do not access, use, or exploit any credentials discovered during testing
+- Comply with applicable laws and the target's terms of service
 
-- ✅ Always obtain proper authorization before scanning
-- ✅ Follow responsible disclosure practices
-- ✅ Respect privacy and comply with laws
-- ✅ Use for defensive security purposes
-- ✅ Validate findings before reporting
+If you discover live credentials using this tool:
 
-### Responsible Disclosure
-
-If you discover secrets using this tool:
-1. **Verify** the finding is legitimate
-2. **Check** if it's still active
-3. **Follow** responsible disclosure guidelines
-4. **Never** abuse or exploit discovered credentials
-5. **Report** to the appropriate security team
-
-### Legal Compliance
-- Comply with Computer Fraud and Abuse Act (CFAA)
-- Respect robots.txt and terms of service
-- Only test systems you own or have written permission to test
-- Do not disrupt services or access unauthorized data
+1. Verify the finding is legitimate
+2. Confirm whether the credential is still active
+3. Report it through the appropriate responsible disclosure channel
+4. Do not use or share the credential beyond what disclosure requires
 
 ---
 
-## 🙏 Acknowledgments
+## License
 
-- **Security research community** for feedback and patterns
-- **Bug bounty hunters** for real-world testing
-- **Open source projects** for inspiration
-- **GitHub Secret Scanning** for patterns reference
-- **TruffleHog** for entropy-based detection concepts
+[MIT License](LICENSE)
 
----
-
-## 📞 Support
-
-- **GitHub Issues**: [https://github.com/INTELEON404/RevealKeys/issues](https://github.com/INTELEON404/RevealKeys/issues)
-- **Developer**: [@INTELEON404](https://github.com/INTELEON404)
-- **Version**: 1.0 
+This tool is provided as-is. The author is not responsible for misuse or
+damage resulting from its use.
 
 ---
 
-## 🌟 Star History
+## Support
 
-[![Star History Chart](https://api.star-history.com/svg?repos=INTELEON404/RevealKeys&type=Date)](https://star-history.com/#INTELEON404/RevealKeys&Date)
-
----
-
-## 📈 Roadmap
-
-- [x] **v1.0** - Initial release with comprehensive pattern detection
-- [ ] **v1.1** - Machine learning-based detection improvements
-- [ ] **v1.2** - Web UI for visualization and reporting
-- [ ] **v2.0** - Cloud provider API validation integration
-- [ ] **Future** - Database of known leaked secrets
-- [ ] **Future** - Integration with secret management tools
-- [ ] **Future** - Export to multiple formats (JSON, CSV, HTML)
-- [ ] **Future** - Slack/Discord notifications
-- [ ] **Future** - GitHub Action integration
-
----
-
-> [!TIP]
-> ### 💡 Tips & Tricks
-
-### Quick Tips
-1. **Start with default settings** (`-me 3.5`) for best balance
-2. **Use `-d` flag** when investigating specific URLs
-3. **Combine with other recon tools** for comprehensive coverage
-4. **Always validate findings** before reporting or acting
-5. **Adjust entropy threshold** based on your specific needs
-
-### Pro Tips
-
-```bash
-# Save results with timestamp
-./revealkeys < urls.txt | tee results_$(date +%Y%m%d_%H%M%S).txt
-
-# Filter by severity
-./revealkeys < urls.txt | grep -E "\[CRITICAL\]|\[HIGH\]"
-
-# Exclude test/staging domains
-cat urls.txt | grep -v -E "(test|demo|staging|dev|localhost)" | ./revealkeys
-
-# Process large datasets in batches
-split -l 1000 urls.txt batch_
-for f in batch_*; do cat $f | ./revealkeys >> results.txt; done
-
-# Monitor performance with time command
-time cat urls.txt | ./revealkeys -t 100
-```
-
-### Troubleshooting
-
-```bash
-# If build fails, check Go version
-go version
-
-# If permission denied
-chmod +x revealkeys
-
-# If missing dependencies
-go mod download
-go mod tidy
-
-# Test with verbose output
-cat urls.txt | ./revealkeys -d
-```
-
----
-
-<p align="center">
-  <strong>Happy Hunting! 🎯</strong>
-</p>
-
-<p align="center">
-  Made with ❤️ by <a href="https://github.com/INTELEON404">INTELEON404</a>
-</p>
-
-<p align="center">
-  <a href="#revealkeys-">⬆️ Back to Top</a>
-</p>
-
----
-
-> [!WARNING]
-> **Remember**: With great power comes great responsibility. Use this tool ethically and legally! 🛡️
-> 
-> **Always**: 
-> - Get proper authorization
-> - Follow responsible disclosure
-> - Respect privacy
-> - Comply with laws and regulations
-> - Use for security improvement, not exploitation
-
----
-
-**License**: MIT  
-**Copyright**: © 2024 INTELEON404  
-**Disclaimer**: Use at your own risk. The developers are not responsible for any misuse or damage caused by this tool.
-
----
-
-<div align="center">
-  
-  **⭐ If you find this tool useful, please give it a star on GitHub! ⭐**
-  
-  [![GitHub stars](https://img.shields.io/github/stars/INTELEON404/RevealKeys?style=social)](https://github.com/INTELEON404/RevealKeys)
-  [![GitHub forks](https://img.shields.io/github/forks/INTELEON404/RevealKeys?style=social)](https://github.com/INTELEON404/RevealKeys)
-  
-</div>
-
+- Issues: https://github.com/inteleon404/whatpwn/issues
+- Author: https://github.com/inteleon404
