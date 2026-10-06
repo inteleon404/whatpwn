@@ -3,1334 +3,2122 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
-var (
-	thread       *int
-	silent       *bool
-	ua           *string
-	rc           *string
-	detailed     *bool
-	secrets      map[string]bool = make(map[string]bool)
-	secretsMux   sync.Mutex
-	extrapattern *string
-	minEntropy   *float64
-	noEntropy    *bool
-	stats        ScanStats
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONSTANTS & VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const (
+	toolName    = "WhatPwn"
+	toolVersion = "1.1.2"
+	toolAuthor  = "Inteleon404"
+	toolDesc    = "Advanced Credentials & Secrets Disclosure Hunter"
 )
 
-// ScanStats tracks scanning statistics
-type ScanStats struct {
-	URLsProcessed int
-	SecretsFound  int
-	StartTime     time.Time
-	mu            sync.Mutex
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Pattern represents a single regex detection pattern
+type Pattern struct {
+	Name    string         // Human-readable pattern name
+	Re      *regexp.Regexp // Compiled regex
+	Keyword bool           // true = keyword=value style (relaxed FP)
+	Custom  bool           // true = user-supplied via -e flag
 }
 
-// SecretPattern represents a secret detection pattern with metadata
-type SecretPattern struct {
-	Name       string
-	Pattern    *regexp.Regexp
-	MinEntropy float64
-	Category   string
-	Severity   string
+// Finding represents a single discovered credential/secret
+type Finding struct {
+	URL   string `json:"url"`
+	Type  string `json:"type"`
+	Match string `json:"match"`
 }
 
-// calculateEntropy calculates Shannon entropy of a string
+// Stats tracks scanning statistics
+type Stats struct {
+	URLs     int64
+	Found    int64
+	Dupes    int64
+	Errors   int64
+	Bytes    int64
+	Requests int64
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GLOBAL STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var (
+	patterns []Pattern
+	seen     sync.Map
+	st       Stats
+	outFile  *os.File
+	jsonOut  *os.File
+	start    time.Time
+)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FLAGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var (
+	// Connection
+	threadsFlag   = flag.Int("t", 25, "concurrent threads")
+	timeoutFlag   = flag.Int("timeout", 15, "request timeout in seconds")
+	retryFlag     = flag.Int("retry", 1, "retry count on failure")
+	uaFlag        = flag.String("ua", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", "user-agent")
+	proxyFlag     = flag.String("proxy", "", "http proxy (e.g. http://127.0.0.1:8080)")
+	verifyTLSFlag = flag.Bool("verify", false, "verify TLS certificates")
+	headerFlag    = flag.String("H", "", "custom header (e.g. 'Cookie: session=abc')")
+
+	// Input/Output
+	listFlag   = flag.String("l", "", "input file containing URLs (default: stdin)")
+	outputFlag = flag.String("o", "", "output file path")
+	jsonFlag   = flag.String("json", "", "JSON output file path")
+	extraFlag  = flag.String("e", "", "extra regex file (one regex per line)")
+
+	// Behavior
+	silentFlag    = flag.Bool("silent", false, "silent mode (no banner/summary)")
+	noColorFlag   = flag.Bool("nc", false, "no color output")
+	entropyFlag   = flag.Bool("entropy", false, "entropy-filter keyword matches")
+	minEntropyF   = flag.Float64("min-entropy", 3.2, "minimum shannon entropy (with -entropy)")
+	maxBodyFlag   = flag.Int("max-body", 5, "max response body size to scan (MB)")
+	maxMatchFlag  = flag.Int("mm", 5, "max matches per pattern per page")
+	showStatsFlag = flag.Bool("stats", false, "show detailed statistics")
+)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  COLOR CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const (
+	C_RESET  = "\033[0m"
+	C_BOLD   = "\033[1m"
+	C_DIM    = "\033[2m"
+	C_ITALIC = "\033[3m"
+	C_UNDER  = "\033[4m"
+
+	C_BLACK   = "\033[30m"
+	C_RED     = "\033[31m"
+	C_GREEN   = "\033[32m"
+	C_YELLOW  = "\033[33m"
+	C_BLUE    = "\033[34m"
+	C_MAGENTA = "\033[35m"
+	C_CYAN    = "\033[36m"
+	C_WHITE   = "\033[37m"
+
+	C_GRAY = "\033[90m"
+
+	C_BRED = "\033[1;31m"
+	C_BGRN = "\033[1;32m"
+	C_BYLW = "\033[1;33m"
+	C_BBLU = "\033[1;34m"
+	C_BMAG = "\033[1;35m"
+	C_BCYN = "\033[1;36m"
+	C_BWHT = "\033[1;37m"
+
+	C_ORYLW = "\033[0;33m" // orange/yellow for banner
+)
+
+// colorize wraps string with color code if enabled
+func colorize(enabled bool, code, s string) string {
+	if !enabled {
+		return s
+	}
+	return code + s + C_RESET
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CUSTOM USAGE (nuclei/projectdiscovery-style grouped help)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func printUsage() {
+	nc := !*noColorFlag
+	hdr := func(s string) string { return colorize(nc, C_BBLU, s) }
+	// flg pads the raw label to a fixed width BEFORE colorizing, so ANSI
+	// escape bytes never get counted toward column width (which would
+	// otherwise break alignment when color is enabled).
+	flg := func(s string) string { return colorize(nc, C_BYLW, fmt.Sprintf("%-18s", s)) }
+	def := func(s string) string { return colorize(nc, C_GRAY, s) }
+
+	fmt.Println(colorize(nc, C_BRED, ` ▓ ▄  ▓ █▄▄▄  ▀▀▓ █▄▄  █▀▀▓ ▓ ▄  ▓ ▓▀▀█`))
+	fmt.Println(colorize(nc, C_BRED, ` █ █ ▄█ █  █ █   ▄ █   █   █ █ ▄█ █  █`))
+	fmt.Println(colorize(nc, C_BRED, ` ▓▄█▄█  █  ▓ ▓▄▄▓ █▄▄▓ ▓▀▀▀ ▓▄█▄█  █  ▓`))
+	fmt.Printf("\n  %s v%s | %s\n\n", colorize(nc, C_BCYN, toolName), toolVersion, toolDesc)
+
+	fmt.Printf("%s\n", hdr("USAGE:"))
+	fmt.Printf("  whatpwn [flags]\n\n")
+
+	fmt.Printf("%s\n", hdr("INPUT:"))
+	fmt.Printf("  %s stdin (default) or -l for a list of URLs/hosts\n", flg("-l string"))
+	fmt.Println()
+
+	fmt.Printf("%s\n", hdr("OUTPUT:"))
+	fmt.Printf("  %s write findings to file\n", flg("-o string"))
+	fmt.Printf("  %s write findings as JSON lines\n", flg("-json string"))
+	fmt.Printf("  %s disable color output %s\n", flg("-nc"), def("(default false)"))
+	fmt.Printf("  %s silent mode, no banner/summary %s\n", flg("-silent"), def("(default false)"))
+	fmt.Printf("  %s show detailed scan statistics %s\n", flg("-stats"), def("(default false)"))
+	fmt.Println()
+
+	fmt.Printf("%s\n", hdr("CONFIG:"))
+	fmt.Printf("  %s concurrent threads %s\n", flg("-t int"), def("(default 25)"))
+	fmt.Printf("  %s request timeout in seconds %s\n", flg("-timeout int"), def("(default 15)"))
+	fmt.Printf("  %s retry count on failure %s\n", flg("-retry int"), def("(default 1)"))
+	fmt.Printf("  %s custom user-agent\n", flg("-ua string"))
+	fmt.Printf("  %s custom header, e.g. 'Cookie: session=abc'\n", flg("-H string"))
+	fmt.Printf("  %s http proxy, e.g. http://127.0.0.1:8080\n", flg("-proxy string"))
+	fmt.Printf("  %s verify TLS certificates %s\n", flg("-verify"), def("(default false)"))
+	fmt.Println()
+
+	fmt.Printf("%s\n", hdr("FILTER:"))
+	fmt.Printf("  %s extra regex file, one pattern per line\n", flg("-e string"))
+	fmt.Printf("  %s entropy-filter keyword matches %s\n", flg("-entropy"), def("(default false)"))
+	fmt.Printf("  %s minimum shannon entropy %s\n", flg("-min-entropy float"), def("(default 3.2)"))
+	fmt.Printf("  %s max response body size to scan, MB %s\n", flg("-max-body int"), def("(default 5)"))
+	fmt.Printf("  %s max matches per pattern per page %s\n", flg("-mm int"), def("(default 5)"))
+	fmt.Println()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ASCII BANNER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func printBanner() {
+	if *silentFlag {
+		return
+	}
+
+	nc := !*noColorFlag
+
+	fmt.Println()
+
+	if nc {
+		banner := `[0;31;47m▓[0;37m [0;31m▄[0;37m  [0;31m▓[0;37m [0;31m█▄▄▄[0;37m  [0;31m▀▀▓[0;37m [0;31m█▄▄[0;37m  [0;31m█▀▀▓[0;37m [0;31;47m▓[0;37m [0;31m▄[0;37m  [0;31m▓[0;37m [0;31;47m▓[0;31m▀▀█[0m
+[0;31m█[0;37m [0;31m█[0;37m [0;31m▄█[0;37m [0;31m█[0;37m  [0;31m█[0;37m [0;31m█▀▀█[0;37m [0;31m█[0;37m  [0;31m▄[0;37m [0;31m█[0;37m  [0;31m█[0;37m [0;31m█[0;37m [0;31m█[0;37m [0;31m▄█[0;37m [0;31m█[0;37m  [0;31m█[0m
+[0;31m▓▄█▄█[0;37m  [0;31m█[0;37m  [0;31;47m▓[0;37m [0;31m▓▄▄[0;31;47m▓[0;37m [0;31m█▄▄[0;31;47m▓[0;37m [0;31;47m▓[0;31m▀▀▀[0;37m [0;31m▓▄█▄█[0;37m  [0;31m█[0;37m  [0;31m▓[0m`
+
+		fmt.Println(banner)
+	} else {
+		fmt.Println(`▓ ▄  ▓ █▄▄▄  ▀▀▓ █▄▄  █▀▀▓ ▓ ▄  ▓ ▓▀▀█`)
+		fmt.Println(`█ █ ▄█ █  █ █▀▀█ █  ▄ █  █ █ █ ▄█ █  █`)
+		fmt.Println(`▓▄█▄█  █  ▓ ▓▄▄▓ █▄▄▓ ▓▀▀▀ ▓▄█▄█  █  ▓`)
+	}
+
+	fmt.Println()
+
+	fmt.Printf("  %s v%s | %s\n",
+		colorize(nc, C_BCYN, toolName),
+		toolVersion,
+		colorize(nc, C_GRAY, toolDesc),
+	)
+
+	fmt.Printf("  %s %d patterns loaded | threads: %d | timeout: %ds\n",
+		colorize(nc, C_CYAN, "▸"),
+		len(patterns),
+		*threadsFlag,
+		*timeoutFlag,
+	)
+
+	fmt.Println(colorize(nc, C_GRAY, "  "+strings.Repeat("─", 56)))
+	fmt.Println()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FALSE POSITIVE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var (
+	// all-digit detection
+	allDigitRe = regexp.MustCompile(`^\d+$`)
+
+	// html tag detection
+	htmlTagRe = regexp.MustCompile(`^</?[a-zA-Z]`)
+
+	// url-only detection
+	urlOnlyRe = regexp.MustCompile(`^https?://[^\s]+$`)
+
+	// common false positive words/fragments
+	fpWords = []string{
+		// placeholders
+		"example", "sample", "placeholder", "your_", "your-", "<your",
+		"my_", "my-", "insert_", "enter_", "replace_", "fill_",
+		"type_here", "${", "{{", "%s", "%d", "{token}", "{secret}",
+		// documentation
+		"todo", "fixme", "lorem", "ipsum", "hackme", "notreal",
+		// test values
+		"xxxx", "****", "....", "aaaa", "bbbb", "cccc",
+		"changeme", "change_me", "dummy", "fake", "mock",
+		"redacted", "censored", "hidden", "masked",
+		// keyboard patterns
+		"qwerty", "asdf", "zxcv", "qazwsx",
+		// sequential
+		"abcdef", "123456", "000000", "111111",
+		"aaaaaa", "test123", "test_123", "testtest",
+		"sample_value", "example_value",
+		// common FP
+		"falsepositive", "false_positive", "notasecret",
+		"not_secret", "no_secret", "empty_secret",
+	}
+
+	// exact value denies
+	denyValues = map[string]bool{
+		// booleans
+		"true": true, "false": true, "yes": true, "no": true,
+		"on": true, "off": true, "enabled": true, "disabled": true,
+		// nulls
+		"null": true, "none": true, "nil": true, "undefined": true,
+		"nan": true, "void": true, "empty": true, "blank": true,
+		// numbers
+		"0": true, "1": true, "-1": true, "-": true, "_": true,
+		// config keys (value == key name means no real value)
+		"password": true, "passwd": true, "pwd": true,
+		"secret": true, "token": true, "key": true,
+		"apikey": true, "api_key": true, "api-key": true,
+		"secret_key": true, "secret-key": true, "secretkey": true,
+		"access_key": true, "access-key": true, "accesskey": true,
+		"auth_token": true, "auth-token": true, "authtoken": true,
+		"access_token": true, "access-token": true,
+		"client_secret": true, "client-secret": true,
+		"private_key": true, "private-key": true,
+		"public_key": true, "public-key": true,
+		// auth headers
+		"bearer": true, "basic": true, "digest": true, "oauth": true,
+		// env/config
+		"env": true, "config": true, "settings": true, "opts": true,
+		"params": true, "headers": true, "options": true,
+		// common placeholder values
+		"changeme": true, "change_me": true, "change-me": true,
+		"your_password": true, "your-password": true, "yourpassword": true,
+		"password_here": true, "password-here": true,
+		"enter_password": true, "enter-password": true,
+		"placeholder": true, "placeholder_value": true,
+		"secret_here": true, "token_here": true, "key_here": true,
+		"xxx": true, "xxxx": true, "xxxxx": true,
+		// sequential numbers
+		"12345678": true, "123456789": true, "1234567890": true,
+		"00000000": true, "11111111": true, "1234567890123456": true,
+		// common weak passwords
+		"password123": true, "password1": true, "admin123": true,
+		"letmein": true, "welcome": true, "monkey": true,
+		"dragon": true, "master": true, "login": true,
+		"abc123": true, "qwerty123": true, "root": true,
+		"toor": true, "administrator": true, "guest": true,
+		// framework defaults
+		"changeit": true, "changeit123": true, "default": true,
+		"changeme123": true, "changeme_123": true,
+	}
+)
+
+// calculateEntropy computes Shannon entropy of a string
 func calculateEntropy(s string) float64 {
 	if len(s) == 0 {
 		return 0
 	}
-
-	freq := make(map[rune]float64)
-	for _, char := range s {
-		freq[char]++
+	freq := make(map[rune]int)
+	for _, c := range s {
+		freq[c]++
 	}
-
-	var entropy float64
-	length := float64(len(s))
-
-	for _, count := range freq {
-		p := count / length
-		entropy -= p * math.Log2(p)
+	var e float64
+	l := float64(len(s))
+	for _, n := range freq {
+		p := float64(n) / l
+		e -= p * math.Log2(p)
 	}
-
-	return entropy
+	return e
 }
 
-// hasHighEntropy checks if string has sufficient randomness
-func hasHighEntropy(s string, minEntropy float64) bool {
-	parts := regexp.MustCompile(`[=:]\s*['"]?([^'"}\s]+)['"]?`).FindStringSubmatch(s)
-	if len(parts) > 1 {
-		s = parts[1]
+// hasLongRepeatRun reports whether s contains the same byte repeated 5 or
+// more times consecutively (e.g. "aaaaa", "11111").
+//
+// This replaces the RE2-incompatible backreference regex `(.)\1{4,}`.
+// Go's regexp package uses RE2, which intentionally does not support
+// backreferences, so repeated-character detection is implemented here as
+// plain native Go logic instead: a single linear scan over the string
+// tracking the current run length.
+func hasLongRepeatRun(s string) bool {
+	const minRun = 5 // same semantics as the original {4,} after one base char: 1+4 = 5
+	if len(s) < minRun {
+		return false
 	}
-
-	return calculateEntropy(s) >= minEntropy
+	run := 1
+	for i := 1; i < len(s); i++ {
+		if s[i] == s[i-1] {
+			run++
+			if run >= minRun {
+				return true
+			}
+		} else {
+			run = 1
+		}
+	}
+	return false
 }
 
-// containsCommonWords checks for false positive indicators
-func containsCommonWords(s string) bool {
-	lowerS := strings.ToLower(s)
-	falsePositives := []string{
-		"example", "test", "demo", "sample", "placeholder", "your_", "my_",
-		"<", ">", "xxx", "***", "...", "todo", "fixme", "lorem", "ipsum",
-		"12345", "abcde", "qwerty", "admin", "root", "change", "replace",
+// isFPKeyword checks if a keyword=value match is likely a false positive
+// (relaxed rules — matches YAML behavior, shows short values like "h")
+func isFPKeyword(v string, useEntropy bool) bool {
+	if v == "" {
+		return true
+	}
+	low := strings.ToLower(v)
+
+	// exact deny list
+	if denyValues[low] {
+		return true
 	}
 
-	for _, fp := range falsePositives {
-		if strings.Contains(lowerS, fp) {
+	// pure numbers (likely IDs, not secrets)
+	if allDigitRe.MatchString(low) && len(low) < 12 {
+		return true
+	}
+
+	// HTML tags
+	if htmlTagRe.MatchString(v) {
+		return true
+	}
+
+	// pure URLs (not secrets)
+	if urlOnlyRe.MatchString(v) && !strings.Contains(v, "@") {
+		return true
+	}
+
+	// FP word fragments
+	for _, w := range fpWords {
+		if strings.Contains(low, w) {
 			return true
 		}
 	}
-	return false
-}
 
-// isLikelyFalsePositive performs multiple checks
-func isLikelyFalsePositive(s string, requireEntropy bool, minEnt float64) bool {
-	if containsCommonWords(s) {
+	// repeated characters (e.g. "aaaaaa", "111111")
+	if len(v) > 6 && hasLongRepeatRun(v) {
 		return true
 	}
 
-	if len(s) < 10 {
-		return true
-	}
-
-	if requireEntropy && !hasHighEntropy(s, minEnt) {
-		return true
-	}
-
-	if regexp.MustCompile(`(.)\1{5,}`).MatchString(s) {
-		return true
-	}
-
-	return false
-}
-
-// initializePatterns creates all secret detection patterns
-func initializePatterns() []SecretPattern {
-	// High-confidence patterns first
-	highConfidencePatterns := []SecretPattern{
-		{
-			Name:       "AWS Access Key ID",
-			Pattern:    regexp.MustCompile(`(?i)(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`),
-			MinEntropy: 3.5,
-			Category:   "AWS",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "GitHub Personal Access Token",
-			Pattern:    regexp.MustCompile(`ghp_[0-9a-zA-Z]{36}`),
-			MinEntropy: 4.0,
-			Category:   "GitHub",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "GitHub OAuth Token",
-			Pattern:    regexp.MustCompile(`gho_[0-9a-zA-Z]{36}`),
-			MinEntropy: 4.0,
-			Category:   "GitHub",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "GitHub App Token",
-			Pattern:    regexp.MustCompile(`(ghu|ghs)_[0-9a-zA-Z]{36}`),
-			MinEntropy: 4.0,
-			Category:   "GitHub",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "GitHub Refresh Token",
-			Pattern:    regexp.MustCompile(`ghr_[0-9a-zA-Z]{76}`),
-			MinEntropy: 4.0,
-			Category:   "GitHub",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "Slack Token",
-			Pattern:    regexp.MustCompile(`xox[baprs]-([0-9a-zA-Z]{10,48})`),
-			MinEntropy: 3.5,
-			Category:   "Slack",
-			Severity:   "HIGH",
-		},
-		{
-			Name:       "Slack Webhook",
-			Pattern:    regexp.MustCompile(`https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}`),
-			MinEntropy: 0.0,
-			Category:   "Slack",
-			Severity:   "HIGH",
-		},
-		{
-			Name:       "Google API Key",
-			Pattern:    regexp.MustCompile(`AIza[0-9A-Za-z\-_]{35}`),
-			MinEntropy: 3.5,
-			Category:   "Google",
-			Severity:   "HIGH",
-		},
-		{
-			Name:       "Stripe Live Secret Key",
-			Pattern:    regexp.MustCompile(`sk_live_[0-9a-zA-Z]{24,}`),
-			MinEntropy: 4.0,
-			Category:   "Stripe",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "Stripe Restricted Key",
-			Pattern:    regexp.MustCompile(`rk_live_[0-9a-zA-Z]{24,}`),
-			MinEntropy: 4.0,
-			Category:   "Stripe",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "SendGrid API Key",
-			Pattern:    regexp.MustCompile(`SG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}`),
-			MinEntropy: 4.0,
-			Category:   "SendGrid",
-			Severity:   "HIGH",
-		},
-		{
-			Name:       "NPM Access Token",
-			Pattern:    regexp.MustCompile(`npm_[0-9a-zA-Z]{36}`),
-			MinEntropy: 3.5,
-			Category:   "NPM",
-			Severity:   "HIGH",
-		},
-		{
-			Name:       "JWT Token",
-			Pattern:    regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`),
-			MinEntropy: 3.5,
-			Category:   "JWT",
-			Severity:   "MEDIUM",
-		},
-		{
-			Name:       "RSA Private Key",
-			Pattern:    regexp.MustCompile(`-----BEGIN RSA PRIVATE KEY-----`),
-			MinEntropy: 0.0,
-			Category:   "Private Key",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "Private Key",
-			Pattern:    regexp.MustCompile(`-----BEGIN PRIVATE KEY-----`),
-			MinEntropy: 0.0,
-			Category:   "Private Key",
-			Severity:   "CRITICAL",
-		},
-		{
-			Name:       "OpenSSH Private Key",
-			Pattern:    regexp.MustCompile(`-----BEGIN OPENSSH PRIVATE KEY-----`),
-			MinEntropy: 0.0,
-			Category:   "Private Key",
-			Severity:   "CRITICAL",
-		},
-	}
-
-	// Comprehensive pattern list from Code Two (high-value patterns)
-	var additionalPatternsStrings = []string{
-		`COGNITO_IDENTITY[A-Z0-9_]*:\s*"[^"]+"`,
-		`REACT_APP_[A-Z_]+:\s*"([^"]+)"`,
-		"(xox[p|b|o|a]-[0-9]{12}-[0-9]{12}-[0-9]{12}-[a-z0-9]{32})",
-		"https://hooks.slack.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}",
-		"[h|H][e|E][r|R][o|O][k|K][u|U].{0,30}[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}",
-		"key-[0-9a-zA-Z]{32}",
-		"[0-9a-f]{32}-us[0-9]{1,2}",
-		"sk_live_[0-9a-z]{32}",
-		"AIza[0-9A-Za-z-_]{35}",
-		"6L[0-9A-Za-z-_]{38}",
-		"ya29\\.[0-9A-Za-z\\-_]+",
-		"AKIA[0-9A-Z]{16}",
-		"amzn\\.mws\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-		"s3\\.amazonaws.com[/]+|[a-zA-Z0-9_-]*\\.s3\\.amazonaws.com",
-		"EAACEdEose0cBA[0-9A-Za-z]+",
-		"SK[0-9a-fA-F]{32}",
-		"AC[a-zA-Z0-9_\\-]{32}",
-		"AP[a-zA-Z0-9_\\-]{32}",
-		"access_token\\$production\\$[0-9a-z]{16}\\$[0-9a-f]{32}",
-		"sq0csp-[0-9A-Za-z\\-_]{43}",
-		"sqOatp-[0-9A-Za-z\\-_]{22}",
-		"[a-zA-Z0-9_-]*:[a-zA-Z0-9_\\-]+@github\\.com*",
-		"-----BEGIN PRIVATE KEY-----[a-zA-Z0-9\\S]{100,}-----END PRIVATE KEY-----",
-		"-----BEGIN RSA PRIVATE KEY-----[a-zA-Z0-9\\S]{100,}-----END RSA PRIVATE KEY-----",
-		`(?i)[\"']?firebase[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sendgrid[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailgun[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twilio[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?docker[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?api[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?database[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?db[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysql[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?postgres[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?oauth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`Basic [A-Za-z0-9+/]{15,}`,
-	}
-
-	// Add the comprehensive patterns list from your second req function
-	var comprehensivePatternsStrings = []string{
-		`COGNITO_IDENTITY[A-Z0-9_]*:\s*"[^"]+"`,
-		`(?P<key>CANDEX_[A-Z_]+):\s*"(?P<value>[^"]+)"`,
-		`REACT_APP_[A-Z_]+:\s*"([^"]+)"`,
-		`com\.amplify\.Cognito\.[a-z0-9-]+\.([a-zA-Z0-9]+)\.identityId`,
-		`Basic [A-Za-z0-9+/]{15}`,
-		"(xox[p|b|o|a]-[0-9]{12}-[0-9]{12}-[0-9]{12}-[a-z0-9]{32})",
-		"https://hooks.slack.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}",
-		"[f|F][a|A][c|C][e|E][b|B][o|O][o|O][k|K].{0,30}['\"\\s][0-9a-f]{32}['\"\\s]",
-		"[t|T][w|W][i|I][t|T][t|T][e|E][r|R].{0,30}['\"\\s][0-9a-zA-Z]{35,44}['\"\\s]",
-		"[h|H][e|E][r|R][o|O][k|K][u|U].{0,30}[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}",
-		"key-[0-9a-zA-Z]{32}",
-		"[0-9a-f]{32}-us[0-9]{1,2}",
-		"sk_live_[0-9a-z]{32}",
-		"[0-9(+-[0-9A-Za-z_]{32}.apps.qooqleusercontent.com",
-		"AIza[0-9A-Za-z-_]{35}",
-		"6L[0-9A-Za-z-_]{38}",
-		"ya29\\.[0-9A-Za-z\\-_]+",
-		"AKIA[0-9A-Z]{16}",
-		"amzn\\.mws\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-		"s3\\.amazonaws.com[/]+|[a-zA-Z0-9_-]*\\.s3\\.amazonaws.com",
-		"EAACEdEose0cBA[0-9A-Za-z]+",
-		"key-[0-9a-zA-Z]{32}",
-		"SK[0-9a-fA-F]{32}",
-		"AC[a-zA-Z0-9_\\-]{32}",
-		"AP[a-zA-Z0-9_\\-]{32}",
-		"access_token\\$production\\$[0-9a-z]{16}\\$[0-9a-f]{32}",
-		"sq0csp-[ 0-9A-Za-z\\-_]{43}",
-		"sqOatp-[0-9A-Za-z\\-_]{22}",
-		"sk_live_[0-9a-zA-Z]{24}",
-		"rk_live_[0-9a-zA-Z]{24}",
-		"[a-zA-Z0-9_-]*:[a-zA-Z0-9_\\-]+@github\\.com*",
-		"-----BEGIN PRIVATE KEY-----[a-zA-Z0-9\\S]{100,}-----END PRIVATE KEY-----",
-		"-----BEGIN RSA PRIVATE KEY-----[a-zA-Z0-9\\S]{100,}-----END RSA PRIVATE KEY-----",
-		`(?i)[\"']?zopim[_-]?account[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?zhuliang[_-]?gh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?zensonatypepassword[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)zendesk(_api_token|_key|_token|-travis-github|_url|_username)(\\s|=)`,
-		`(?i)[\"']?yt[_-]?server[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?yt[_-]?partner[_-]?refresh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?yt[_-]?partner[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?yt[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?yt[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?yt[_-]?account[_-]?refresh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?yt[_-]?account[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?yangshun[_-]?gh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?yangshun[_-]?gh[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?www[_-]?googleapis[_-]?com[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wpt[_-]?ssh[_-]?private[_-]?key[_-]?base64[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wpt[_-]?ssh[_-]?connect[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wpt[_-]?report[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wpt[_-]?prepare[_-]?dir[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wpt[_-]?db[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wpt[_-]?db[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wporg[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wpjm[_-]?phpunit[_-]?google[_-]?geocode[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wordpress[_-]?db[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wordpress[_-]?db[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wincert[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?test[_-]?server[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?fb[_-]?password[_-]?3[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?fb[_-]?password[_-]?2[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?fb[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?basic[_-]?password[_-]?5[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?basic[_-]?password[_-]?4[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?basic[_-]?password[_-]?3[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?basic[_-]?password[_-]?2[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?widget[_-]?basic[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?watson[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?watson[_-]?device[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?watson[_-]?conversation[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?wakatime[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?vscetoken[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?visual[_-]?recognition[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?virustotal[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?vip[_-]?github[_-]?deploy[_-]?key[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?vip[_-]?github[_-]?deploy[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?vip[_-]?github[_-]?build[_-]?repo[_-]?deploy[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?v[_-]?sfdc[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?v[_-]?sfdc[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?usertravis[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?user[_-]?assets[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?user[_-]?assets[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?use[_-]?ssh[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?us[_-]?east[_-]?1[_-]?elb[_-]?amazonaws[_-]?com[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?urban[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?urban[_-]?master[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?urban[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?unity[_-]?serial[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?unity[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twitteroauthaccesstoken[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twitteroauthaccesssecret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twitter[_-]?consumer[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twitter[_-]?consumer[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twine[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twilio[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twilio[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twilio[_-]?configuration[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twilio[_-]?chat[_-]?account[_-]?api[_-]?service[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twilio[_-]?api[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?twilio[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?trex[_-]?okta[_-]?client[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?trex[_-]?client[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?secure[_-]?env[_-]?vars[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?pull[_-]?request[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?gh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?e2e[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?com[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?branch[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?travis[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?token[_-]?core[_-]?java[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?thera[_-]?oss[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?tester[_-]?keys[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?test[_-]?test[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?test[_-]?github[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?tesco[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?svn[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?surge[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?surge[_-]?login[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?stripe[_-]?public[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?stripe[_-]?private[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?strip[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?strip[_-]?publishable[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?stormpath[_-]?api[_-]?key[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?stormpath[_-]?api[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?starship[_-]?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?starship[_-]?account[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?star[_-]?test[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?star[_-]?test[_-]?location[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?star[_-]?test[_-]?bucket[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?star[_-]?test[_-]?aws[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?staging[_-]?base[_-]?url[_-]?runscope[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ssmtp[_-]?config[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sshpass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?srcclr[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?square[_-]?reader[_-]?sdk[_-]?repository[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sqssecretkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sqsaccesskey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?spring[_-]?mail[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?spotify[_-]?api[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?spotify[_-]?api[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?spaces[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?spaces[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?soundcloud[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?soundcloud[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonatypepassword[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonatype[_-]?token[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonatype[_-]?token[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonatype[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonatype[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonatype[_-]?nexus[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonatype[_-]?gpg[_-]?passphrase[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonatype[_-]?gpg[_-]?key[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonar[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonar[_-]?project[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sonar[_-]?organization[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?socrata[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?socrata[_-]?app[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?snyk[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?snyk[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?snoowrap[_-]?refresh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?snoowrap[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?snoowrap[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?slate[_-]?user[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?slash[_-]?developer[_-]?space[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?slash[_-]?developer[_-]?space[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?signing[_-]?key[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?signing[_-]?key[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?signing[_-]?key[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?signing[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?setsecretkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?setdstsecretkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?setdstaccesskey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ses[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ses[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?service[_-]?account[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sentry[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sentry[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sentry[_-]?endpoint[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sentry[_-]?default[_-]?org[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sentry[_-]?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sendwithus[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sendgrid[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sendgrid[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sendgrid[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sendgrid[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sendgrid[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sendgrid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?selion[_-]?selenium[_-]?host[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?selion[_-]?log[_-]?level[_-]?dev[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?segment[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secretkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secretaccesskey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?key[_-]?base[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?9[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?8[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?7[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?6[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?5[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?4[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?3[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?2[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?11[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?10[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?1[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?secret[_-]?0[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sdr[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?scrutinizer[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sauce[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sandbox[_-]?aws[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sandbox[_-]?aws[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sandbox[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?salesforce[_-]?bulk[_-]?test[_-]?security[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?salesforce[_-]?bulk[_-]?test[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sacloud[_-]?api[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sacloud[_-]?access[_-]?token[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?sacloud[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?user[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?secret[_-]?assets[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?secret[_-]?app[_-]?logs[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?key[_-]?assets[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?key[_-]?app[_-]?logs[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?external[_-]?3[_-]?amazonaws[_-]?com[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?bucket[_-]?name[_-]?assets[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?bucket[_-]?name[_-]?app[_-]?logs[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?s3[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?rubygems[_-]?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?rtd[_-]?store[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?rtd[_-]?key[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?route53[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ropsten[_-]?private[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?rinkeby[_-]?private[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?rest[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?repotoken[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?reporting[_-]?webdav[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?reporting[_-]?webdav[_-]?pwd[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?release[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?release[_-]?gh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?registry[_-]?secure[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?registry[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?refresh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?rediscloud[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?redis[_-]?stunnel[_-]?urls[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?randrmusicapiaccesstoken[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?rabbitmq[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?quip[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?qiita[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?pypi[_-]?passowrd[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?pushover[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?publish[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?publish[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?publish[_-]?access[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?project[_-]?config[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?prod[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?prod[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?prod[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?private[_-]?signing[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?pring[_-]?mail[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?preferred[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?prebuild[_-]?auth[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?postgresql[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?postgresql[_-]?db[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?postgres[_-]?env[_-]?postgres[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?postgres[_-]?env[_-]?postgres[_-]?db[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?plugin[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?plotly[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?places[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?places[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?pg[_-]?host[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?pg[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?personal[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?personal[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?percy[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?percy[_-]?project[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?paypal[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?passwordtravis[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?parse[_-]?js[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?pagerduty[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?packagecloud[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ossrh[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ossrh[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ossrh[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ossrh[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ossrh[_-]?jira[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?os[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?os[_-]?auth[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?org[_-]?project[_-]?gradle[_-]?sonatype[_-]?nexus[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?org[_-]?gradle[_-]?project[_-]?sonatype[_-]?nexus[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?openwhisk[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?open[_-]?whisk[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?onesignal[_-]?user[_-]?auth[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?onesignal[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?omise[_-]?skey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?omise[_-]?pubkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?omise[_-]?pkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?omise[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?okta[_-]?oauth2[_-]?clientsecret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?okta[_-]?oauth2[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?okta[_-]?client[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ofta[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ofta[_-]?region[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ofta[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?octest[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?octest[_-]?app[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?octest[_-]?app[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?oc[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?object[_-]?store[_-]?creds[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?object[_-]?store[_-]?bucket[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?object[_-]?storage[_-]?region[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?object[_-]?storage[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?oauth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?numbers[_-]?service[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?nuget[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?nuget[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?nuget[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?npm[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?npm[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?npm[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?npm[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?npm[_-]?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?npm[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?npm[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?now[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?non[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?node[_-]?pre[_-]?gyp[_-]?secretaccesskey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?node[_-]?pre[_-]?gyp[_-]?github[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?node[_-]?pre[_-]?gyp[_-]?accesskeyid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?node[_-]?env[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ngrok[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ngrok[_-]?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?nexuspassword[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?nexus[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?new[_-]?relic[_-]?beta[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?netlify[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?nativeevents[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysqlsecret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysqlmasteruser[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysql[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysql[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysql[_-]?root[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysql[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysql[_-]?hostname[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mysql[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?my[_-]?secret[_-]?env[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?multi[_-]?workspace[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?multi[_-]?workflow[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?multi[_-]?disconnect[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?multi[_-]?connect[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?multi[_-]?bob[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?minio[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?minio[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mile[_-]?zero[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mh[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mh[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mg[_-]?public[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mg[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mapboxaccesstoken[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mapbox[_-]?aws[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mapbox[_-]?aws[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mapbox[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mapbox[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?manifest[_-]?app[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?manifest[_-]?app[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mandrill[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?managementapiaccesstoken[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?management[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?manage[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?manage[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailgun[_-]?secret[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailgun[_-]?pub[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailgun[_-]?pub[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailgun[_-]?priv[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailgun[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailgun[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailgun[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailer[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailchimp[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mailchimp[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?mail[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?magento[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?magento[_-]?auth[_-]?username [\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?magento[_-]?auth[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?lottie[_-]?upload[_-]?cert[_-]?key[_-]?store[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?lottie[_-]?upload[_-]?cert[_-]?key[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?lottie[_-]?s3[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?lottie[_-]?happo[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?lottie[_-]?happo[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?looker[_-]?test[_-]?runner[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ll[_-]?shared[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ll[_-]?publish[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?linux[_-]?signing[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?linkedin[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?lighthouse[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?lektor[_-]?deploy[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?lektor[_-]?deploy[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?leanplum[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?kxoltsn3vogdop92m[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?kubeconfig[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?kubecfg[_-]?s3[_-]?path[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?kovan[_-]?private[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?keystore[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?kafka[_-]?rest[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?kafka[_-]?instance[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?kafka[_-]?admin[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?jwt[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?jdbc:mysql[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?jdbc[_-]?host[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?jdbc[_-]?databaseurl[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?itest[_-]?gh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ios[_-]?docs[_-]?deploy[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?internal[_-]?secrets[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?integration[_-]?test[_-]?appid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?integration[_-]?test[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?index[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ij[_-]?repo[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ij[_-]?repo[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?hub[_-]?dxia2[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?homebrew[_-]?github[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?hockeyapp[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?heroku[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?heroku[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?heroku[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?hb[_-]?codesign[_-]?key[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?hb[_-]?codesign[_-]?gpg[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?hab[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?hab[_-]?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?grgit[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gren[_-]?github[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gradle[_-]?signing[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gradle[_-]?signing[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gradle[_-]?publish[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gradle[_-]?publish[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gpg[_-]?secret[_-]?keys[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gpg[_-]?private[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gpg[_-]?passphrase[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gpg[_-]?ownertrust[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gpg[_-]?keyname[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gpg[_-]?key[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?google[_-]?private[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?google[_-]?maps[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?google[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?google[_-]?client[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?google[_-]?client[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?google[_-]?account[_-]?type[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gogs[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gitlab[_-]?user[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?tokens[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?repo[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?release[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?pwd[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?oauth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?oauth[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?hunter[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?hunter[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?deployment[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?deploy[_-]?hb[_-]?doc[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?auth[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?github[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?git[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?git[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?git[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?git[_-]?committer[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?git[_-]?committer[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?git[_-]?author[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?git[_-]?author[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ghost[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ghb[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?unstable[_-]?oauth[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?repo[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?oauth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?oauth[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?next[_-]?unstable[_-]?oauth[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?next[_-]?unstable[_-]?oauth[_-]?client[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?next[_-]?oauth[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gh[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gcs[_-]?bucket[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gcr[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gcloud[_-]?service[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gcloud[_-]?project[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?gcloud[_-]?bucket[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ftp[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ftp[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ftp[_-]?pw[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ftp[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ftp[_-]?login[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ftp[_-]?host[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?fossa[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?flickr[_-]?api[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?flickr[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?flask[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?firefox[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?firebase[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?firebase[_-]?project[_-]?develop[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?firebase[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?firebase[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?firebase[_-]?api[_-]?json[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?file[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?exp[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?eureka[_-]?awssecretkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?env[_-]?sonatype[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?env[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?env[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?env[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?env[_-]?heroku[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?env[_-]?github[_-]?oauth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?end[_-]?user[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?encryption[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?elasticsearch[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?elastic[_-]?cloud[_-]?auth[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?dsonar[_-]?projectkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?dsonar[_-]?login[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?droplet[_-]?travis[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?dropbox[_-]?oauth[_-]?bearer[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?doordash[_-]?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?dockerhubpassword[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?dockerhub[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?docker[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?docker[_-]?postgres[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?docker[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?docker[_-]?passwd[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?docker[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?docker[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?docker[_-]?hub[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?digitalocean[_-]?ssh[_-]?key[_-]?ids[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?digitalocean[_-]?ssh[_-]?key[_-]?body[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?digitalocean[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?dgpg[_-]?passphrase[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?deploy[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?deploy[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?deploy[_-]?secure[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?deploy[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ddgc[_-]?github[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ddg[_-]?test[_-]?email[_-]?pw[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ddg[_-]?test[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?db[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?db[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?db[_-]?pw[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?db[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?db[_-]?host[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?db[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?db[_-]?connection[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?datadog[_-]?app[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?datadog[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?database[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?database[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?database[_-]?port[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?database[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?database[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?database[_-]?host[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?danger[_-]?github[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cypress[_-]?record[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?coverity[_-]?scan[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?coveralls[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?coveralls[_-]?repo[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?coveralls[_-]?api[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cos[_-]?secrets[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?conversation[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?conversation[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?contentful[_-]?v2[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?contentful[_-]?test[_-]?org[_-]?cma[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?contentful[_-]?php[_-]?management[_-]?test[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?contentful[_-]?management[_-]?api[_-]?access[_-]?token[_-]?new[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?contentful[_-]?management[_-]?api[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?contentful[_-]?integration[_-]?management[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?contentful[_-]?cma[_-]?test[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?contentful[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?consumerkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?consumer[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?conekta[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?coding[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?codecov[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?codeclimate[_-]?repo[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?codacy[_-]?project[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cocoapods[_-]?trunk[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cocoapods[_-]?trunk[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cn[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cn[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?clu[_-]?ssh[_-]?private[_-]?key[_-]?base64[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?clu[_-]?repo[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudinary[_-]?url[_-]?staging[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudinary[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudflare[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudflare[_-]?auth[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudflare[_-]?auth[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudflare[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?service[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?processed[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?parsed[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?order[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?instance[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?audited[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloudant[_-]?archived[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cloud[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?clojars[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cli[_-]?e2e[_-]?cma[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?claimr[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?claimr[_-]?superuser[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?claimr[_-]?db[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?claimr[_-]?database[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ci[_-]?user[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ci[_-]?server[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ci[_-]?registry[_-]?user[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ci[_-]?project[_-]?url[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ci[_-]?deploy[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?chrome[_-]?refresh[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?chrome[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cheverny[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cf[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?certificate[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?censys[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cattle[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cattle[_-]?agent[_-]?instance[_-]?auth[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cattle[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cargo[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?cache[_-]?s3[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bx[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bx[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bundlesize[_-]?github[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?built[_-]?branch[_-]?deploy[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bucketeer[_-]?aws[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bucketeer[_-]?aws[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?browserstack[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?browser[_-]?stack[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?brackets[_-]?repo[_-]?oauth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bluemix[_-]?username[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bluemix[_-]?pwd[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bluemix[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bluemix[_-]?pass[_-]?prod[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bluemix[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bluemix[_-]?auth[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bluemix[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bintraykey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bintray[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bintray[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bintray[_-]?gpg[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bintray[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?bintray[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?b2[_-]?bucket[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?b2[_-]?app[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?awssecretkey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?awscn[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?awscn[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?awsaccesskeyid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?ses[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?ses[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?secrets[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?config[_-]?secretaccesskey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?config[_-]?accesskeyid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aws[_-]?access[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?author[_-]?npm[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?author[_-]?email[_-]?addr[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?auth0[_-]?client[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?auth0[_-]?api[_-]?clientsecret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?auth[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?assistant[_-]?iam[_-]?apikey[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?artifacts[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?artifacts[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?artifacts[_-]?bucket[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?artifacts[_-]?aws[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?artifacts[_-]?aws[_-]?access[_-]?key[_-]?id[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?artifactory[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?argos[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?apple[_-]?id[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?appclientsecret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?app[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?app[_-]?secrete[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?app[_-]?report[_-]?token[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?app[_-]?bucket[_-]?perm[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?apigw[_-]?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?apiary[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?api[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?api[_-]?key[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?api[_-]?key[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aos[_-]?sec[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?aos[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?ansible[_-]?vault[_-]?password[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?android[_-]?docs[_-]?deploy[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?anaconda[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?amazon[_-]?secret[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?amazon[_-]?bucket[_-]?name[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?alicloud[_-]?secret[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?alicloud[_-]?access[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?alias[_-]?pass[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?search[_-]?key[_-]?1[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?search[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?search[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?api[_-]?key[_-]?search[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?api[_-]?key[_-]?mcm[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?admin[_-]?key[_-]?mcm[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?admin[_-]?key[_-]?2[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?algolia[_-]?admin[_-]?key[_-]?1[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?air[-_]?table[-_]?api[-_]?key[\"']?[=:][\"']?.+[\"']`,
-		`(?i)[\"']?adzerk[_-]?api[_-]?key[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?admin[_-]?email[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?account[_-]?sid[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?access[_-]?token[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?access[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-		`(?i)[\"']?access[_-]?key[_-]?secret[\"']?[^\\S\r\n]*[=:][^\\S\r\n]*[\"']?[\\w-]+[\"']?`,
-	}
-
-	patterns := highConfidencePatterns
-
-	// Merge all patterns, removing duplicates
-	allPatternStrings := make(map[string]bool)
-	for _, patternStr := range additionalPatternsStrings {
-		allPatternStrings[patternStr] = true
-	}
-	for _, patternStr := range comprehensivePatternsStrings {
-		allPatternStrings[patternStr] = true
-	}
-
-	// Add additional patterns as medium-confidence
-	for patternStr := range allPatternStrings {
-		if pattern, err := regexp.Compile(patternStr); err == nil {
-			patterns = append(patterns, SecretPattern{
-				Name:       "Pattern Match",
-				Pattern:    pattern,
-				MinEntropy: 3.0,
-				Category:   "Generic",
-				Severity:   "MEDIUM",
-			})
+	// entropy check (optional)
+	if useEntropy && len(v) >= 8 {
+		if calculateEntropy(v) < *minEntropyF {
+			return true
 		}
 	}
 
-	return patterns
+	return false
 }
 
-// cleanSecret removes quotes and whitespace from extracted secret
-func cleanSecret(s string) string {
+// isFPValue checks if a structured token match is a false positive
+// (strict rules — structured tokens should be long and random)
+func isFPValue(v string, useEntropy bool) bool {
+	if len(v) < 6 {
+		return true
+	}
+	return isFPKeyword(v, useEntropy)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MATCH CLEANING
+//  "sentry_key": "this" → sentry_key:this
+//  refresh_token = "h"  → refresh_token=h
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var (
+	sepCleanupRe = regexp.MustCompile(`\s*([=:])\s*`)
+	quoteStripRe = regexp.MustCompile(`["'` + "`" + `]`)
+	trailingRe   = regexp.MustCompile(`[,;)\]}]+$`)
+	leadRe       = regexp.MustCompile(`^[,;\[{(]+`)
+)
+
+func cleanMatch(s string) string {
 	s = strings.TrimSpace(s)
-	s = strings.Trim(s, "'\"")
+	s = sepCleanupRe.ReplaceAllString(s, "$1")
+	s = quoteStripRe.ReplaceAllString(s, "")
+	s = trailingRe.ReplaceAllString(s, "")
+	s = leadRe.ReplaceAllString(s, "")
+	s = strings.TrimRight(s, ".")
+	// collapse whitespace
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 80 {
+		s = s[:80]
+	}
 	return s
 }
 
-// analyzeContent scans content for secrets
-func analyzeContent(content string, patterns []SecretPattern, extraPattern string) []map[string]string {
-	var findings []map[string]string
-	lines := strings.Split(content, "\n")
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PATTERN REGISTRATION
+// ═══════════════════════════════════════════════════════════════════════════════
 
-	for _, pattern := range patterns {
-		matches := pattern.Pattern.FindAllString(content, -1)
-
-		for _, match := range matches {
-			cleanMatch := cleanSecret(match)
-
-			secretsMux.Lock()
-			if secrets[cleanMatch] {
-				secretsMux.Unlock()
-				continue
-			}
-			secretsMux.Unlock()
-
-			requireEntropy := pattern.MinEntropy > 0 && !*noEntropy
-			if isLikelyFalsePositive(cleanMatch, requireEntropy, pattern.MinEntropy) {
-				continue
-			}
-
-			if requireEntropy && !hasHighEntropy(cleanMatch, pattern.MinEntropy) {
-				continue
-			}
-
-			secretsMux.Lock()
-			secrets[cleanMatch] = true
-			secretsMux.Unlock()
-
-			lineNum := 0
-			for i, line := range lines {
-				if strings.Contains(line, match) {
-					lineNum = i + 1
-					break
-				}
-			}
-
-			findings = append(findings, map[string]string{
-				"secret":   cleanMatch,
-				"type":     pattern.Name,
-				"line":     strconv.Itoa(lineNum),
-				"category": pattern.Category,
-				"severity": pattern.Severity,
-			})
-		}
+// addP registers a new structured pattern
+func addP(name, re string) {
+	comp, err := regexp.Compile(re)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] pattern '%s' failed to compile: %v\n", name, err)
+		return
 	}
-
-	// Check extra pattern
-	if len(extraPattern) > 0 {
-		extraRegex, err := regexp.Compile(extraPattern)
-		if err == nil {
-			matches := extraRegex.FindAllString(content, -1)
-			for _, match := range matches {
-				cleanMatch := cleanSecret(match)
-
-				secretsMux.Lock()
-				alreadyFound := secrets[cleanMatch]
-				if !alreadyFound {
-					secrets[cleanMatch] = true
-				}
-				secretsMux.Unlock()
-
-				if !alreadyFound {
-					lineNum := 0
-					for i, line := range lines {
-						if strings.Contains(line, match) {
-							lineNum = i + 1
-							break
-						}
-					}
-
-					findings = append(findings, map[string]string{
-						"secret":   cleanMatch,
-						"type":     "Custom Pattern",
-						"line":     strconv.Itoa(lineNum),
-						"category": "Custom",
-						"severity": "CUSTOM",
-					})
-				}
-			}
-		}
-	}
-
-	return findings
+	patterns = append(patterns, Pattern{Name: name, Re: comp})
 }
 
-// getSeverityColor returns color code based on severity
-func getSeverityColor(severity string) string {
-	switch severity {
-	case "CRITICAL":
-		return "\033[1;31m" // Bright Red
-	case "HIGH":
-		return "\033[1;33m" // Bright Yellow
-	case "MEDIUM":
-		return "\033[1;36m" // Bright Cyan
-	case "CUSTOM":
-		return "\033[1;35m" // Bright Magenta
-	default:
-		return "\033[1;32m" // Bright Green
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STRUCTURED PATTERNS — Exact Format Tokens (200+ patterns)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func initStructuredPatterns() {
+	/* ────────────────────────────────────────────────────────────────
+	   AWS / AMAZON WEB SERVICES
+	──────────────────────────────────────────────────────────────── */
+
+	addP("AWS Access Key ID",
+		`(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA|ACCA|ASIA)[A-Z0-9]{16}`)
+
+	addP("AWS Access Key (Context)",
+		`(?i)(?:aws|amazon)[_\-.]?access[_\-.]?key[_\-.]?id\s*[=:]\s*["']?(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA|ACCA)[A-Z0-9]{16}["']?`)
+
+	addP("AWS Secret Key (Context)",
+		`(?i)aws[_\-.]?secret[_\-.]?access[_\-.]?key\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}["']?`)
+
+	addP("AWS Secret Key (40char near keyword)",
+		`(?i)(?:secret|key|token|credential).{0,30}?["']?[A-Za-z0-9/+]{40}["']?`)
+
+	addP("AWS Session Token",
+		`(?i)aws[_\-.]?session[_\-.]?token\s*[=:]\s*["']?[A-Za-z0-9/+=]{50,}["']?`)
+
+	addP("AWS MWS Auth Token",
+		`amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+
+	addP("AWS S3 Error: InvalidAccessKeyId",
+		`InvalidAccessKeyId`)
+
+	addP("AWS S3 Error: SignatureDoesNotMatch",
+		`SignatureDoesNotMatch`)
+
+	addP("AWS S3 Error: InvalidURI",
+		`InvalidURI`)
+
+	addP("AWS S3 Error: InvalidArgument",
+		`InvalidArgument`)
+
+	addP("AWS S3 Error: NoSuchBucket",
+		`NoSuchBucket`)
+
+	addP("AWS S3 Error: NoSuchKey",
+		`NoSuchKey`)
+
+	addP("AWS S3 Error: AccessDenied",
+		`AccessDenied.*ListBucketResult|ListBucketResult.*AccessDenied`)
+
+	addP("AWS S3 Error: BucketAlreadyExists",
+		`BucketAlreadyExists`)
+
+	addP("AWS S3 Error: PermanentRedirect",
+		`PermanentRedirect.*s3\.amazonaws\.com`)
+
+	addP("AWS S3 Open Bucket Listing",
+		`<ListBucketResult[\s>]`)
+
+	addP("AWS S3 Bucket Contents",
+		`<Contents>.*?<Key>[^<]+</Key>`)
+
+	addP("AWS S3 Bucket URL",
+		`[a-zA-Z0-9._\-]+\.s3(?:\.[a-z0-9\-]+)?\.amazonaws\.com`)
+
+	addP("AWS S3 Bucket Path",
+		`s3://[a-zA-Z0-9._\-]+`)
+
+	addP("AWS S3 Console URL",
+		`s3\.console\.aws\.amazon\.com/s3/buckets/[a-zA-Z0-9._\-]+`)
+
+	addP("AWS ARN",
+		`arn:aws:[a-z0-9\-]+:[a-z0-9\-]*:\d{12}:\S+`)
+
+	addP("AWS Cognito Identity Pool ID",
+		`[a-f0-9]{8}:[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
+
+	addP("AWS Cognito User Pool ID",
+		`[a-z]{2}-[a-z]+-\d_[A-Za-z0-9]{9}`)
+
+	addP("AWS CloudFront Distribution",
+		`[a-z0-9]+\.cloudfront\.net`)
+
+	addP("AWS ELB URL",
+		`[a-zA-Z0-9\-]+\.elb\.amazonaws\.com`)
+
+	addP("AWS EC2 Instance",
+		`ec2[_\-.]?\d{1,3}[_\-.]?\d{1,3}[_\-.]?\d{1,3}[_\-.]?\d{1,3}\.compute\.amazonaws\.com`)
+
+	addP("AWS Lambda Function ARN",
+		`arn:aws:lambda:[a-z0-9\-]+:\d{12}:function:[a-zA-Z0-9\-_]+`)
+
+	addP("AWS DynamoDB Table",
+		`dynamodb\.[a-z0-9\-]+\.amazonaws\.com`)
+
+	addP("AWS SQS Queue",
+		`sqs\.[a-z0-9\-]+\.amazonaws\.com/[0-9]+/[a-zA-Z0-9\-_]+`)
+
+	addP("AWS SNS Topic",
+		`sns\.[a-z0-9\-]+\.amazonaws\.com/[0-9]+/[a-zA-Z0-9\-_]+`)
+
+	addP("AWS RDS Endpoint",
+		`[a-zA-Z0-9\-]+\.rds\.amazonaws\.com`)
+
+	addP("AWS Secrets Manager",
+		`arn:aws:secretsmanager:[a-z0-9\-]+:\d{12}:secret:[a-zA-Z0-9/_+=.\-]+`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   MICROSOFT AZURE
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Azure Storage Account Key",
+		`AccountKey=[A-Za-z0-9/+=]{88}`)
+
+	addP("Azure Storage Connection String",
+		`(?i)DefaultEndpointsProtocol=https;AccountName=[a-z0-9]+;AccountKey=[A-Za-z0-9/+=]{88}`)
+
+	addP("Azure Client Secret",
+		`(?i)azure[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9~._\-]{30,})["']?`)
+
+	addP("Azure Subscription ID",
+		`(?i)azure[_\-.]?subscription[_\-.]?id\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Azure Tenant ID",
+		`(?i)azure[_\-.]?tenant[_\-.]?id\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Azure AD App ID",
+		`(?i)azure[_\-.]?ad[_\-.]?app[_\-.]?id\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Azure Service Principal",
+		`(?i)azure[_\-.]?service[_\-.]?principal\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Azure SAS Token",
+		`(?i)\?sv=\d{4}-\d{2}-\d{2}&ss=[a-z]&srt=[a-z]&sp=[a-z]+&se=\d{4}-\d{2}-\d{2}T[a-zA-Z0-9:]+&sig=[A-Za-z0-9%]+`)
+
+	addP("Azure Cognitive Services Key",
+		`(?i)cognitive[_\-.]?services[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Azure DevOps PAT",
+		`(?i)azure[_\-.]?devops[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9]{52})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   GOOGLE CLOUD / FIREBASE
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Google Cloud API Key",
+		`AIza[0-9A-Za-z\-_]{35}`)
+
+	addP("Google OAuth Access Token",
+		`ya29\.[0-9A-Za-z\-_]+`)
+
+	addP("Google OAuth Client ID",
+		`[0-9]{8,12}-[0-9a-z_]{32}\.apps\.googleusercontent\.com`)
+
+	addP("Google OAuth Client Secret",
+		`(?i)google[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9_\-]{24,})["']?`)
+
+	addP("Google Service Account JSON",
+		`"type"\s*:\s*"service_account"`)
+
+	addP("Google Service Account Private Key",
+		`"private_key"\s*:\s*"-----BEGIN PRIVATE KEY-----`)
+
+	addP("Google Cloud Service Account Email",
+		`[a-z0-9\-]+@[a-z0-9\-]+\.iam\.gserviceaccount\.com`)
+
+	addP("Firebase/FCM Server Key",
+		`AAAA[A-Za-z0-9_\-]{7}:[A-Za-z0-9_\-]{140}`)
+
+	addP("Firebase Web API Key",
+		`(?i)firebase[_\-.]?api[_\-.]?key\s*[=:]\s*["']?(AIza[0-9A-Za-z\-_]{35})["']?`)
+
+	addP("Firebase App ID",
+		`\d+:[a-z0-9]+:[a-z]+:[a-f0-9]{24}`)
+
+	addP("Firebase Project ID",
+		`(?i)firebase[_\-.]?project[_\-.]?id\s*[=:]\s*["']?([a-z0-9\-]+)["']?`)
+
+	addP("Google reCAPTCHA Site Key",
+		`6L[0-9A-Za-z\-_]{38}`)
+
+	addP("Google reCAPTCHA Secret",
+		`(?i)recaptcha[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9_\-]{40})["']?`)
+
+	addP("Google Maps API Key",
+		`(?i)google[_\-.]?maps[_\-.]?api[_\-.]?key\s*[=:]\s*["']?(AIza[0-9A-Za-z\-_]{35})["']?`)
+
+	addP("Google Cloud Storage URL",
+		`storage\.googleapis\.com/[a-zA-Z0-9\-_]+`)
+
+	addP("Google Cloud Function URL",
+		`[a-z0-9\-]+\.cloudfunctions\.net/[a-zA-Z0-9\-_]+`)
+
+	addP("Google OAuth Refresh Token",
+		`1//[0-9A-Za-z\-_]{30,}`)
+
+	addP("Google OAuth Authorization Code",
+		`4/[0-9A-Za-z\-_\-]{30,}`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   GITHUB / GITLAB / BITBUCKET
+	──────────────────────────────────────────────────────────────── */
+
+	addP("GitHub Personal Access Token (ghp_)",
+		`ghp_[A-Za-z0-9]{36}`)
+
+	addP("GitHub OAuth Token (gho_)",
+		`gho_[A-Za-z0-9]{36}`)
+
+	addP("GitHub App Token (ghu_)",
+		`ghu_[A-Za-z0-9]{36}`)
+
+	addP("GitHub App Server Token (ghs_)",
+		`ghs_[A-Za-z0-9]{36}`)
+
+	addP("GitHub Refresh Token (ghr_)",
+		`ghr_[A-Za-z0-9]{76}`)
+
+	addP("GitHub Fine-grained PAT",
+		`github_pat_[A-Za-z0-9_]{82}`)
+
+	addP("GitHub URL with Credentials",
+		`https://[A-Za-z0-9_.\-]+:[A-Za-z0-9_\-]+@github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+`)
+
+	addP("GitHub OAuth App Secret",
+		`(?i)github[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{40})["']?`)
+
+	addP("GitHub Webhook Secret",
+		`(?i)github[_\-.]?webhook[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("GitHub Deploy Key",
+		`(?i)github[_\-.]?deploy[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("GitLab Personal Access Token",
+		`glpat-[A-Za-z0-9\-_]{20}`)
+
+	addP("GitLab Runner Registration Token",
+		`GR1348941[A-Za-z0-9\-_]{20}`)
+
+	addP("GitLab OAuth Token",
+		`(?i)gitlab[_\-.]?oauth[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9\-_]{20,})["']?`)
+
+	addP("Bitbucket App Password",
+		`(?i)bitbucket[_\-.]?app[_\-.]?password\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("Bitbucket OAuth Secret",
+		`(?i)bitbucket[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{32,})["']?`)
+
+	addP("Bitbucket OAuth Key",
+		`(?i)bitbucket[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{18,})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   SLACK / TELEGRAM / DISCORD / TEAMS
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Slack Bot Token (xoxb)",
+		`xoxb-[0-9A-Za-z\-]{51}`)
+
+	addP("Slack User Token (xoxp)",
+		`xoxp-[0-9A-Za-z\-]{72}`)
+
+	addP("Slack App Token (xoxa)",
+		`xoxa-[0-9A-Za-z\-]{10,60}`)
+
+	addP("Slack Legacy Token (xoxs)",
+		`xoxs-[0-9A-Za-z\-]{10,60}`)
+
+	addP("Slack Refresh Token (xoxr)",
+		`xoxr-[0-9A-Za-z\-]{10,60}`)
+
+	addP("Slack Generic OAuth Token",
+		`xox[pboa]-[0-9]{12}-[0-9]{12}-[0-9]{12}-[a-z0-9]{32}`)
+
+	addP("Slack Webhook URL",
+		`https://hooks\.slack\.com/services/T[A-Za-z0-9_]{8,}/B[A-Za-z0-9_]{8,}/[A-Za-z0-9_]{20,}`)
+
+	addP("Slack Signing Secret",
+		`(?i)slack[_\-.]?signing[_\-.]?secret\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Slack Verification Token",
+		`(?i)slack[_\-.]?verification[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("Telegram Bot Token",
+		`\b[0-9]{8,10}:AA[A-Za-z0-9_\-]{33}`)
+
+	addP("Telegram Bot API URL",
+		`https://api\.telegram\.org/bot[0-9]{8,10}:[A-Za-z0-9_\-]{35}`)
+
+	addP("Discord Bot Token",
+		`\b[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}`)
+
+	addP("Discord Webhook URL",
+		`https://discord(?:app)?\.com/api/webhooks/\d{15,}/[A-Za-z0-9_\-]{60,}`)
+
+	addP("Discord Client Secret",
+		`(?i)discord[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9_\-]{30,})["']?`)
+
+	addP("Microsoft Teams Webhook",
+		`https://[a-z0-9]+\.webhook\.office\.com/[^"'\s]{40,}`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   TWILIO
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Twilio Account SID (AC)",
+		`\bAC[a-f0-9]{32}\b`)
+
+	addP("Twilio API Key SID (SK)",
+		`\bSK[a-f0-9]{32}\b`)
+
+	addP("Twilio App SID (AP)",
+		`\bAP[a-f0-9]{32}\b`)
+
+	addP("Twilio Auth Token",
+		`(?i)twilio[_\-.]?auth[_\-.]?token\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Twilio API Secret",
+		`(?i)twilio[_\-.]?api[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{32})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   PAYMENTS — STRIPE / PAYPAL / SQUARE / RAZORPAY
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Stripe Live Secret Key (sk_live)",
+		`sk_live_[0-9a-zA-Z]{24,}`)
+
+	addP("Stripe Live Restricted Key (rk_live)",
+		`rk_live_[0-9a-zA-Z]{24,}`)
+
+	addP("Stripe Test Secret Key (sk_test)",
+		`sk_test_[0-9a-zA-Z]{24,}`)
+
+	addP("Stripe Live Publishable Key (pk_live)",
+		`pk_live_[0-9a-zA-Z]{24,}`)
+
+	addP("Stripe Test Publishable Key (pk_test)",
+		`pk_test_[0-9a-zA-Z]{24,}`)
+
+	addP("Stripe Webhook Signing Secret",
+		`whsec_[A-Za-z0-9]{24,}`)
+
+	addP("PayPal Braintree Access Token",
+		`access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}`)
+
+	addP("PayPal Client Secret",
+		`(?i)paypal[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9_\-]{60,})["']?`)
+
+	addP("PayPal Identity Token",
+		`(?i)paypal[_\-.]?identity[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-]{30,})["']?`)
+
+	addP("Square OAuth Token (EAAA)",
+		`EAAA[A-Za-z0-9]{60}`)
+
+	addP("Square Access Token (sq0atp)",
+		`sq0atp-[0-9A-Za-z\-_]{22}`)
+
+	addP("Square OAuth Secret (sq0csp)",
+		`sq0csp-[0-9A-Za-z\-_]{43}`)
+
+	addP("Razorpay Key ID",
+		`rzp_(?:live|test)_[A-Za-z0-9]{14}`)
+
+	addP("Razorpay Secret",
+		`(?i)razorpay[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   EMAIL & MARKETING
+	──────────────────────────────────────────────────────────────── */
+
+	addP("SendGrid API Key",
+		`SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}`)
+
+	addP("Mailgun API Key",
+		`key-[0-9a-zA-Z]{32}`)
+
+	addP("Mailgun Private Key",
+		`(?i)mailgun[_\-.]?priv[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Mailchimp API Key",
+		`\b[0-9a-f]{32}-us[0-9]{1,2}\b`)
+
+	addP("Mandrill API Key",
+		`(?i)mandrill[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9\-_]{22})["']?`)
+
+	addP("Postmark API Token",
+		`(?i)postmark[_\-.]?token\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Amazon SES SMTP Password",
+		`(?i)ses[_\-.]?smtp[_\-.]?password\s*[=:]\s*["']?([A-Za-z0-9/+=]{40})["']?`)
+
+	addP("SMTP Credentials in URL",
+		`smtp://[A-Za-z0-9._%~\-]+:[^\s/@:]{1,64}@`)
+
+	addP("Email with Password in Config",
+		`(?i)email[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   AI / ML SERVICES
+	──────────────────────────────────────────────────────────────── */
+
+	addP("OpenAI API Key (T3BlbkFJ format)",
+		`sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}`)
+
+	addP("OpenAI Project Key",
+		`sk-proj-[A-Za-z0-9_\-]{40,}`)
+
+	addP("OpenAI Legacy Key",
+		`sk-[A-Za-z0-9]{48}`)
+
+	addP("OpenAI Org ID",
+		`org-[A-Za-z0-9]{24,}`)
+
+	addP("Anthropic Claude API Key",
+		`sk-ant-[A-Za-z0-9_\-]{24,}`)
+
+	addP("HuggingFace Token",
+		`hf_[A-Za-z0-9]{34}`)
+
+	addP("Groq API Key",
+		`gsk_[A-Za-z0-9]{52}`)
+
+	addP("Replicate API Key",
+		`r8_[A-Za-z0-9]{37}`)
+
+	addP("Perplexity API Key",
+		`pplx-[A-Za-z0-9]{48}`)
+
+	addP("Mistral API Key",
+		`(?i)mistral[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{32})["']?`)
+
+	addP("Cohere API Key",
+		`(?i)cohere[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{40})["']?`)
+
+	addP("Stability AI Key",
+		`sk-[A-Za-z0-9]{50}`)
+
+	addP("Together AI Key",
+		`(?i)together[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{64})["']?`)
+
+	addP("Deepseek API Key",
+		`sk-[a-f0-9]{32}`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   AUTH — JWT / OAUTH / KEYS
+	──────────────────────────────────────────────────────────────── */
+
+	addP("JWT Token (3 segments)",
+		`eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}`)
+
+	addP("JWT Token (2 segments, unsigned)",
+		`eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\s*$`)
+
+	addP("JWT Token (loose, any structure)",
+		`ey[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.?[A-Za-z0-9\-_.+/=]*`)
+
+	addP("Basic Auth Header",
+		`(?i)basic\s+[a-zA-Z0-9=:_+/\-]{8,100}`)
+
+	addP("Bearer Token",
+		`(?i)bearer\s+[A-Za-z0-9\-._~+/]{16,}`)
+
+	addP("Private Key Header (BEGIN)",
+		`-----BEGIN ((?:RSA|EC|DSA|PGP|OPENSSH|ENCRYPTED) )?PRIVATE KEY( BLOCK)?-----`)
+
+	addP("Private Key Full Block",
+		`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]{100,}?-----END [A-Z ]*PRIVATE KEY-----`)
+
+	addP("SSH Public Key (RSA)",
+		`ssh-rsa\s*AAAAB3NzaC1yc2E[A-Za-z0-9+/=]{100,}`)
+
+	addP("SSH Public Key (Ed25519)",
+		`ssh-ed25519\s*AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/=]{40,}`)
+
+	addP("PGP Private Key Block",
+		`-----BEGIN PGP PRIVATE KEY BLOCK-----`)
+
+	addP("Credentials in URL (user:pass@host)",
+		`(?:ftp|ftps|https?)://[A-Za-z0-9._%~\-]+:[^\s/@:]{1,64}@[A-Za-z0-9.\-]+`)
+
+	addP("Credentials in Generic URL Scheme",
+		`(?:ftp|ftps|http|https)://[A-Za-z0-9\-_:.~]+@`)
+
+	addP("Database Connection with Credentials",
+		`(?i)(?:mysql|postgres(?:ql)?|mongodb(?:\+srv)?|redis|amqp|smtp|mssql)://[^\s:@/]+:[^\s@/]{1,64}@`)
+
+	addP("LDAP Connection with Credentials",
+		`ldaps?://[A-Za-z0-9._%~\-]+:[^\s/@:]{1,64}@`)
+
+	addP("OAuth Client Secret",
+		`(?i)client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9_\-./+=]{20,})["']?`)
+
+	addP("API Key Assignment",
+		`(?i)api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9_\-./+=]{16,})["']?`)
+
+	addP("Access Token Assignment",
+		`(?i)access[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-./+=]{16,})["']?`)
+
+	addP("Auth Token Assignment",
+		`(?i)auth[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-./+=]{16,})["']?`)
+
+	addP("Secret Key Assignment",
+		`(?i)secret[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9_\-./+=]{16,})["']?`)
+
+	addP("Refresh Token Assignment",
+		`(?i)refresh[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-./+=]{10,})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   SOCIAL MEDIA
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Facebook Access Token",
+		`EAACEdEose0cBA[A-Za-z0-9]+`)
+
+	addP("Facebook App Secret",
+		`(?i)facebook[_\-.]?app[_\-.]?secret\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Facebook Access Token in Config",
+		`(?i)facebook[_\-.]?access[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9]{50,})["']?`)
+
+	addP("Twitter Consumer Key",
+		`(?i)twitter[_\-.]?consumer[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("Twitter Consumer Secret",
+		`(?i)twitter[_\-.]?consumer[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{45,})["']?`)
+
+	addP("Twitter Access Token",
+		`[tT]witter.{0,30}[1-9][0-9]+-[0-9a-zA-Z]{40}`)
+
+	addP("LinkedIn Client Secret",
+		`(?i)linkedin[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{16,})["']?`)
+
+	addP("Instagram API Token",
+		`IGQ[A-Za-z0-9_\-]{30,}`)
+
+	addP("Pinterest API Key",
+		`(?i)pinterest[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   DEVOPS & INFRASTRUCTURE
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Heroku API Key",
+		`(?i)heroku.{0,40}?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+
+	addP("DigitalOcean API Token",
+		`dop_v1_[a-f0-9]{64}`)
+
+	addP("DigitalOcean OAuth Token",
+		`doo_v1_[a-f0-9]{64}`)
+
+	addP("Shopify Access Token (shpat_)",
+		`shpat_[a-fA-F0-9]{32}`)
+
+	addP("Shopify Custom App Token (shpca_)",
+		`shpca_[a-fA-F0-9]{32}`)
+
+	addP("Shopify Private App Token (shppa_)",
+		`shppa_[a-fA-F0-9]{32}`)
+
+	addP("Shopify Shared Secret (shpss_)",
+		`shpss_[a-fA-F0-9]{32}`)
+
+	addP("NPM Access Token",
+		`npm_[A-Za-z0-9]{36}`)
+
+	addP("PyPI Upload Token",
+		`pypi-AgEIcHlwaS5vcmc[A-Za-z0-9\-_]{50,}`)
+
+	addP("Postman API Key",
+		`PMAK-[a-f0-9]{24}-[a-f0-9]{34}`)
+
+	addP("Notion API Token",
+		`secret_[A-Za-z0-9]{43}`)
+
+	addP("HashiCorp Vault Token (hvs.)",
+		`\bhvs\.[A-Za-z0-9]{20,}`)
+
+	addP("HashiCorp Vault Token (s.)",
+		`\bs\.[A-Za-z0-9]{20,}`)
+
+	addP("Mapbox Access Token",
+		`pk\.eyJ1[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{30,}`)
+
+	addP("Sentry DSN",
+		`https://[a-f0-9]{32}@[a-z0-9.\-]+\.sentry\.(?:io|sentry\.app)/\d+`)
+
+	addP("Sentry Auth Token",
+		`(?i)sentry[_\-.]?auth[_\-.]?token\s*[=:]\s*["']?([a-f0-9]{64})["']?`)
+
+	addP("Zapier Webhook",
+		`https://hooks\.zapier\.com/hooks/catch/[0-9]+/[A-Za-z0-9]+/`)
+
+	addP("Netlify Access Token",
+		`(?i)netlify[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-]{40,})["']?`)
+
+	addP("Vercel API Token",
+		`(?i)vercel[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9]{24})["']?`)
+
+	addP("CircleCI Token",
+		`(?i)circle[_\-.]?ci[_\-.]?token\s*[=:]\s*["']?([a-f0-9]{40})["']?`)
+
+	addP("Travis CI Token",
+		`(?i)travis[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-]{20,})["']?`)
+
+	addP("Jenkins Secret",
+		`(?i)jenkins[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{32})["']?`)
+
+	addP("Kubernetes Service Account Token",
+		`eyJhbGciOiJSUzI1NiIs[A-Za-z0-9_\-./=]{100,}`)
+
+	addP("Kubernetes Config Reference",
+		`(?i)kubeconfig\s*[=:]\s*["']?([^\s"']{5,})["']?`)
+
+	addP("Terraform Cloud Token",
+		`(?i)terraform[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9\-_.]{20,})["']?`)
+
+	addP("Ansible Vault Password",
+		`(?i)ansible[_\-.]?vault[_\-.]?pass\s*[=:]\s*["']?([^\s"']{5,})["']?`)
+
+	addP("Docker Hub Password",
+		`(?i)docker[_\-.]?password\s*[=:]\s*["']?([^\s"']{8,})["']?`)
+
+	addP("Docker Registry Token",
+		`(?i)docker[_\-.]?token\s*[=:]\s*["']?([a-f0-9]{64})["']?`)
+
+	addP("Consul Token",
+		`(?i)consul[_\-.]?token\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Chef Client Key",
+		`(?i)chef[_\-.]?client[_\-.]?key\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("Puppet Agent Cert",
+		`(?i)puppet[_\-.]?agent[_\-.]?cert\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("Airflow Connection",
+		`(?i)airflow[_\-.]?conn[_\-.]?id\s*[=:]\s*["']?([^\s"']{5,})["']?`)
+
+	addP("GitLab CI/CD Variable",
+		`(?i)gitlab[_\-.]?ci[_\-.]?variable\s*[=:]\s*["']?([^\s"']{5,})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   DATABASES
+	──────────────────────────────────────────────────────────────── */
+
+	addP("MySQL Connection String",
+		`mysql://[A-Za-z0-9_\-]+:[^\s@]{1,64}@`)
+
+	addP("MySQL Password",
+		`(?i)mysql[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("MySQL Root Password",
+		`(?i)mysql[_\-.]?root[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("PostgreSQL Connection String",
+		`postgres(?:ql)?://[A-Za-z0-9_\-]+:[^\s@]{1,64}@`)
+
+	addP("PostgreSQL Password",
+		`(?i)postgres(?:ql)?[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("MongoDB Connection String",
+		`mongodb(?:\+srv)?://[A-Za-z0-9_\-]+:[^\s@]{1,64}@`)
+
+	addP("MongoDB Password",
+		`(?i)mongodb[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Redis Connection String",
+		`redis://[A-Za-z0-9_\-]*:[^\s@]{1,64}@`)
+
+	addP("Redis Password",
+		`(?i)redis[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Elasticsearch Password",
+		`(?i)elastic(?:search)?[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("RabbitMQ Password",
+		`(?i)rabbitmq[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("CouchDB Password",
+		`(?i)couchdb[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Cassandra Password",
+		`(?i)cassandra[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("MSSQL Password",
+		`(?i)mssql[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Database URL",
+		`(?i)database[_\-.]?url\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("DB Password (Generic)",
+		`(?i)db[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Connection String (Generic)",
+		`(?i)connection[_\-.]?string\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("JDBC Connection URL",
+		`jdbc:[a-z]+://[^\s"']+`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   FRAMEWORKS & APPLICATIONS
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Laravel APP_KEY",
+		`base64:[A-Za-z0-9+/]{43}=`)
+
+	addP("Django SECRET_KEY",
+		`(?i)django[_\-.]?secret[_\-.]?key\s*[=:]\s*["']?([^\s"']{20,})["']?`)
+
+	addP("Rails secret_key_base",
+		`(?i)secret[_\-.]?key[_\-.]?base\s*[=:]\s*["']?([a-f0-9]{80,})["']?`)
+
+	addP("WordPress DB Password",
+		`(?i)wordpress[_\-.]?db[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("WordPress Auth Key Salt",
+		`(?i)AUTH[_\s]?KEY['"]?\s*,\s*['"]([^\s"']{20,})['"]`)
+
+	addP("WordPress AUTH_SALT",
+		`(?i)AUTH[_\s]?SALT['"]?\s*,\s*['"]([^\s"']{20,})['"]`)
+
+	addP("WordPress LOGGED_IN_SALT",
+		`(?i)LOGGED[_\s]?IN[_\s]?SALT['"]?\s*,\s*['"]([^\s"']{20,})['"]`)
+
+	addP("Spring Mail Password",
+		`(?i)spring[_\-.]?mail[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Keystore Password",
+		`(?i)keystore[_\-.]?pass(?:word)?\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Key Store Password (camelCase)",
+		`(?i)keyPassword\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Store Password (camelCase)",
+		`(?i)storePassword\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Signing Password",
+		`(?i)signing[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("GPG Passphrase",
+		`(?i)gpg[_\-.]?pass(?:phrase|word)\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Encryption Key Reference",
+		`(?i)encryption[_\-.]?key\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("Session Secret",
+		`(?i)session[_\-.]?secret\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("Webhook Secret",
+		`(?i)webhook[_\-.]?secret\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("Root Password",
+		`(?i)root[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Admin Password",
+		`(?i)admin[_\-.]?pass(?:word)?\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Service Account Secret",
+		`(?i)service[_\-.]?account[_\-.]?secret\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("App Secret (Generic)",
+		`(?i)app[_\-.]?secret\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("Consumer Secret (Generic)",
+		`(?i)consumer[_\-.]?secret\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("Salt Value",
+		`(?i)(?:salt|pepper)[_\-.]?value\s*[=:]\s*["']?([^\s"']{8,})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   SAAS SERVICES & PLATFORMS
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Cloudinary API Secret",
+		`(?i)cloudinary[_\-.]?api[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("Cloudinary API Key",
+		`(?i)cloudinary[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([0-9]{15,})["']?`)
+
+	addP("Cloudinary URL",
+		`cloudinary://[0-9]+:[A-Za-z0-9_\-]+@[a-z0-9\-]+`)
+
+	addP("Pusher App Secret",
+		`(?i)pusher[_\-.]?app[_\-.]?secret\s*[=:]\s*["']?([a-f0-9]{20})["']?`)
+
+	addP("Pusher App Key",
+		`(?i)pusher[_\-.]?app[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{20})["']?`)
+
+	addP("VirusTotal API Key",
+		`(?i)virustotal[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{64})["']?`)
+
+	addP("Snyk API Token",
+		`(?i)snyk[_\-.]?api[_\-.]?token\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("SonarQube Token",
+		`(?i)sonar[_\-.]?token\s*[=:]\s*["']?([a-f0-9]{40})["']?`)
+
+	addP("New Relic License Key",
+		`(?i)new[_\-.]?relic[_\-.]?license[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{40})["']?`)
+
+	addP("Datadog API Key",
+		`(?i)datadog[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Datadog App Key",
+		`(?i)datadog[_\-.]?app[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{40})["']?`)
+
+	addP("Algolia API Key",
+		`(?i)algolia[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Algolia Admin Key",
+		`(?i)algolia[_\-.]?admin[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Algolia Search Key",
+		`(?i)algolia[_\-.]?search[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Segment API Key",
+		`(?i)segment[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{32})["']?`)
+
+	addP("Mixpanel API Token",
+		`(?i)mixpanel[_\-.]?token\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("OneSignal API Key",
+		`(?i)onesignal[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9_\-]{40,})["']?`)
+
+	addP("PagerDuty API Key",
+		`(?i)pagerduty[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9+]{20,})["']?`)
+
+	addP("OpsGenie API Key",
+		`(?i)opsgenie[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Airtable API Key",
+		`(?i)airtable[_\-.]?api[_\-.]?key\s*[=:]\s*["']?(key[A-Za-z0-9]{14})["']?`)
+
+	addP("Intercom API Token",
+		`(?i)intercom[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-]{60,})["']?`)
+
+	addP("Zendesk API Token",
+		`(?i)zendesk[_\-.]?api[_\-.]?token\s*[=:]\s*["']?([a-f0-9]{40})["']?`)
+
+	addP("Zendesk Password",
+		`(?i)zendesk[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("Spotify Client Secret",
+		`(?i)spotify[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9]{60,})["']?`)
+
+	addP("SoundCloud Client Secret",
+		`(?i)soundcloud[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([a-f0-9]{32})["']?`)
+
+	addP("Wakatime API Key",
+		`(?i)wakatime[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Nexus Repository Password",
+		`(?i)nexus[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("OSSRH Password",
+		`(?i)ossrh[_\-.]?password\s*[=:]\s*["']?([^\s"']{4,})["']?`)
+
+	addP("NuGet API Key",
+		`(?i)nuget[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{50,})["']?`)
+
+	addP("Travis CI API Token",
+		`(?i)travis[_\-.]?api[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-]{20,})["']?`)
+
+	addP("Slack OAuth Token",
+		`(?i)slack[_\-.]?oauth[_\-.]?token\s*[=:]\s*["']?(xox[a-z]-[A-Za-z0-9\-]{10,})["']?`)
+
+	addP("Firebase Cloud Messaging Key",
+		`(?i)fcm[_\-.]?server[_\-.]?key\s*[=:]\s*["']?(AAAA[A-Za-z0-9_\-]{7}:[A-Za-z0-9_\-]{140})["']?`)
+
+	addP("Bintray API Key",
+		`(?i)bintray[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("Codecov Token",
+		`(?i)codecov[_\-.]?token\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Coveralls Repo Token",
+		`(?i)coveralls[_\-.]?(?:repo[_\-.]?)?token\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("Codeclimate Repo Token",
+		`(?i)codeclimate[_\-.]?repo[_\-.]?token\s*[=:]\s*["']?([a-f0-9]{64})["']?`)
+
+	addP("Browserstack Access Key",
+		`(?i)browser[_\-.]?stack[_\-.]?access[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9]{20,})["']?`)
+
+	addP("Sauce Labs Access Key",
+		`(?i)sauce[_\-.]?access[_\-.]?key\s*[=:]\s*["']?([a-f0-9\-]{36})["']?`)
+
+	addP("Auth0 Client Secret",
+		`(?i)auth0[_\-.]?client[_\-.]?secret\s*[=:]\s*["']?([A-Za-z0-9_\-]{40,})["']?`)
+
+	addP("Contentful Access Token",
+		`(?i)contentful[_\-.]?(?:management[_\-.]?api[_\-.]?)?access[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-.]{20,})["']?`)
+
+	addP("Cloudflare API Key",
+		`(?i)cloudflare[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{37})["']?`)
+
+	addP("Cloudflare Auth Key",
+		`(?i)cloudflare[_\-.]?auth[_\-.]?key\s*[=:]\s*["']?([a-f0-9]{37})["']?`)
+
+	addP("Okta API Token",
+		`(?i)okta[_\-.]?api[_\-.]?token\s*[=:]\s*["']?([A-Za-z0-9_\-]{40,})["']?`)
+
+	addP("NPM Secret Key",
+		`(?i)npm[_\-.]?secret[_\-.]?key\s*[=:]\s*["']?([A-Za-z0-9_\-]{30,})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   CRYPTO & BLOCKCHAIN
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Ethereum Private Key",
+		`(?i)(?:eth|ethereum)[_\-.]?private[_\-.]?key\s*[=:]\s*["']?(0x[a-fA-F0-9]{64})["']?`)
+
+	addP("Bitcoin Private Key (WIF)",
+		`(?:5[HJK]|K|L)[1-9A-HJ-NP-Za-km-z]{51}`)
+
+	addP("Bitcoin Address",
+		`\b(?:1|3)[a-km-zA-HJ-NP-Z1-9]{25,34}\b`)
+
+	addP("Bitcoin Address (bc1)",
+		`\bbc1[a-z0-9]{25,62}\b`)
+
+	addP("Ethereum Address",
+		`\b0x[a-fA-F0-9]{40}\b`)
+
+	addP("MetaMask Seed Phrase",
+		`(?i)(?:seed|mnemonic|recovery)[_\-.]?phrase\s*[=:]\s*["']?([a-z\s]{40,})["']?`)
+
+	addP("Ropsten/Rinkeby Testnet Private Key",
+		`(?i)(?:ropsten|rinkeby)[_\-.]?private[_\-.]?key\s*[=:]\s*["']?(0x[a-fA-F0-9]{64})["']?`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   SENSITIVE DATA / PII
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Email Address",
+		`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
+
+	addP("Credit Card Number (Visa/MC/Amex/Discover)",
+		`\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b`)
+
+	addP("SSN (US Format)",
+		`\b\d{3}-\d{2}-\d{4}\b`)
+
+	addP("IBAN",
+		`\b[A-Z]{2}\d{2}[A-Z0-9]{4}[A-Z0-9]{7}(?:[A-Z0-9]?){0,16}\b`)
+
+	addP("Internal IP Address",
+		`\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b`)
+
+	addP("Internal Hostname",
+		`(?:internal|intranet|local|staging|dev|test|qa|uat)\.[a-z0-9\-]+\.(?:com|net|org|io|dev|corp|local|internal)`)
+
+	addP("Phone Number (US)",
+		`\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b`)
+
+	/* ────────────────────────────────────────────────────────────────
+	   INFO DISCLOSURE / DEBUG / ERRORS
+	──────────────────────────────────────────────────────────────── */
+
+	addP("Directory Listing",
+		`(?i)index of\s+/[a-z]|directory listing for\s+/`)
+
+	addP("SQL Error Disclosure",
+		`(?i)you have an error in your sql syntax|ORA-\d{5}|SQLSTATE\[\w+\]|valid MySQL result|MySqlClient\.|PostgreSQL.*ERROR|SQLite\.Exception|Warning.*mysql_`)
+
+	addP("PHP Error Disclosure",
+		`(?i)(?:fatal error|parse error|warning|notice)\s*:\s*.+ in\s+.+\.php on line \d+`)
+
+	addP("PHP Warning",
+		`(?i)warning: .+ in .+ on line \d+`)
+
+	addP("PHP Notice",
+		`(?i)notice: undefined (?:index|variable|offset): .+ in .+ on line \d+`)
+
+	addP("Java Stack Trace",
+		`java\.lang\.\w+Exception|at [\w.$]+\([\w.]+:\d+\)`)
+
+	addP("Python Traceback",
+		`Traceback \(most recent call last\):`)
+
+	addP("ASP.NET Error",
+		`Server Error in|ASP\.NET is configured|An unhandled exception was generated`)
+
+	addP("Node.js Error",
+		`(?i)(?:error|ERR!):\s+.*at\s+.+\(?.+:\d+:\d+\)?`)
+
+	addP("Ruby Error",
+		`(?i).+\.rb:\d+:in\s+`)
+
+	addP("Debug Mode Active",
+		`(?i)(?:APP_ENV|APP_DEBUG|NODE_ENV|RAILS_ENV|DJANGO_DEBUG|FLASK_ENV)\s*[=:]\s*["']?(?:true|dev|development|debug|local)["']?`)
+
+	addP("phpinfo Exposed",
+		`phpinfo\(\)`)
+
+	addP("Git Repository Exposed",
+		`\.git/(?:HEAD|config|index)\b`)
+
+	addP("SVN Repository Exposed",
+		`\.svn/(?:entries|wc\.db|all-wcprops)\b`)
+
+	addP("Env File Exposed",
+		`(?i)(?:APP_KEY|DB_PASSWORD|AWS_SECRET_ACCESS_KEY|SECRET_KEY)\s*=\s*[^\s\n]+`)
+
+	addP("Backup File Reference",
+		`(?i)(?:backup|dump|db|database)\.(?:sql|zip|tar\.gz|bak|7z)`)
+
+	addP("Swagger/OpenAPI Exposed",
+		`"swagger"\s*:\s*"2\.0"|"openapi"\s*:\s*"3\.\d`)
+
+	addP("GraphQL Introspection Exposed",
+		`"__schema"\s*:\s*\{`)
+
+	addP("Source Code Disclosure (PHP)",
+		`<\?php|<\?=`)
+
+	addP("Server Signature",
+		`(?i)(?:apache|nginx|microsoft-iis)/[\d.]+`)
+
+	addP("Session ID in URL",
+		`(?i)[?&](?:session_id|sess_id|sid|sessionid|PHPSESSID|jsessionid)=([a-f0-9]{16,})`)
+
+	addP("API Token in URL Parameter",
+		`(?i)[?&](?:api_key|apikey|access_token|token|auth|key|secret)=([A-Za-z0-9_\-]{16,})`)
+
+	addP("Hardcoded Password",
+		`(?i)(?:password|passwd|pwd)\s*[:=]\s*["']([^"']{6,})["']`)
+
+	addP("Hardcoded Secret",
+		`(?i)(?:secret|api_key|api-key|token|auth)\s*[:=]\s*["']([A-Za-z0-9_\-/+=]{16,})["']`)
+
+	addP("Base64 Encoded Credential",
+		`(?:[A-Za-z0-9+/]{40,}={0,2})`)
+
+	addP("Certificate Fingerprint",
+		`(?:sha256|sha1|md5)[\s:=]+[a-f0-9]{40,}`)
+
+	addP("X-Powered-By Disclosure",
+		`(?i)x-powered-by:\s*\S+`)
+
+	addP("Admin Panel Reference",
+		`(?i)(?:admin|administrator|dashboard|panel|cpanel|wp-admin)[-_]?(?:login|panel|area|page)`)
+
+	addP("Internal API Key",
+		`(?i)internal[_\-.]?api[_\-.]?key\s*[=:]\s*["']?([^\s"']{10,})["']?`)
+
+	addP("Elasticsearch URL",
+		`(?:elasticsearch|elastic)\.[a-z0-9\-]+\.(?:com|io|net|aws\.amazon\.com)`)
+
+	addP("Kafka Connection",
+		`(?i)(?:kafka|zookeeper)[_\-.]?(?:broker|server|host)\s*[=:]\s*["']?([^\s"']{5,})["']?`)
+
+	addP("Docker Registry URL",
+		`(?:docker|registry)\.[a-z0-9\-]+\.(?:com|io|net)[/\w]*`)
+
+	addP("Google Cloud Storage Bucket",
+		`storage\.googleapis\.com/[a-zA-Z0-9\-_]+`)
+
+	addP("AWS Secrets Manager ARN",
+		`arn:aws:secretsmanager:[a-z0-9\-]+:\d{12}:secret:[a-zA-Z0-9/_+=.\-]+`)
+
+	addP("Configuration File Content",
+		`(?i)(?:\.env|config\.(?:json|yml|yaml|php|ini|toml))\s*(?:contents?|source|exposed|leaked)`)
+
+	addP("Windows Integrated Security",
+		`(?i)integrated\s*security\s*=\s*(?:sspi|true)`)
+
+	addP("Kafka Admin URL",
+		`(?i)kafka[_\-.]?admin[_\-.]?url\s*[=:]\s*["']?([^\s"']{5,})["']?`)
+
+	addP("Vault Secret Path",
+		`(?:secret|kv)/[\w\-]+/[\w\-]+`)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  KEYWORD PATTERNS — ALL from credentials-disclosure-all.yaml
+//  Auto-generated mega-regex grouped by first letter
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func buildKeywordPatterns() {
+	// special regex-shaped keywords (numbered variants, etc.)
+	specials := []string{
+		`secret[_\-]?\d*`,
+		`widget[_\-]?fb[_\-]?password[_\-]?\d*`,
+		`widget[_\-]?basic[_\-]?password[_\-]?\d*`,
+		`postgres(?:ql)?[_\-]?pass(?:word)?`,
+		`strip[e]?[_\-]?secret[_\-]?key`,
+		`strip[e]?[_\-]?publishable[_\-]?key`,
+	}
+
+	// plain keywords from YAML — "_" auto-converts to [_-]?
+	blob := "" +
+		/* heroku */ "heroku_api_key heroku_token heroku_oauth_secret heroku_oauth_token heroku_secret_token heroku_key heroku_email " +
+		/* mail core */ "mail_host mail_username mail_port mail_encryption mail_password mail_driver mail_from_address mail_from_name mailer_password email_host_password " +
+		/* spring mail */ "spring_mail_password spring_mail_username spring_mail_host " +
+		/* mailchimp */ "mailchimp_api_key mailchimp_key mailchimp_secret " +
+		/* mailgun */ "mailgun_api_key mailgun_secret_api_key mailgun_pub_key mailgun_pub_apikey mailgun_priv_key mailgun_password mailgun_key mailgun_secret mailgun_apikey mailgun_domain mailgun_smtp_password " +
+		/* mandrill */ "mandrill_api_key mandrill_key mandrill_secret mandrill_username " +
+		/* sendgrid */ "sendgrid_username sendgrid_user sendgrid_password sendgrid_key sendgrid_api_key sendgrid_token sendgrid_smtp_password sendgrid " +
+		/* google */ "google_oauth_secret google_secret google_server_key google_private_key google_maps_api_key google_client_secret google_client_id google_client_email google_account_type google_api_key google_api_secret google_app_id gsecr " +
+		/* gpg */ "gpg_secret_keys gpg_private_key gpg_passphrase gpg_ownertrust gpg_keyname gpg_key_name gpg_pass gpg_recipient " +
+		/* htaccess */ "htaccess_pass htaccess_user " +
+		/* incident */ "incident_bot_name incident_channel_name " +
+		/* jwt */ "jwt_passphrase jwt_password jwt_public_key jwt_secret jwt_secret_key jwt_secret_token jwt_token jwt_user jwt_pass jwt_key jwt_signing_key " +
+		/* keystore */ "key_password keypassword keystore_pass keystore_password store_password storepassword storepass key_store_password " +
+		/* signing */ "signing_key_sid signing_key_secret signing_key_password signing_key signing_password signing_keystore_password android_signing_password private_signing_password " +
+		/* maps/pusher */ "maps_api_key mix_pusher_app_cluster mix_pusher_app_key pusher_app_cluster pusher_app_id pusher_app_key pusher_app_secret pushover_token pushover_user_key " +
+		/* mysql */ "mysql_password mysql_root_password mysql_username mysql_user mysql_hostname mysql_database mysqlsecret mysqlmasteruser mysql_host mysql_port mysql_db " +
+		/* oauth */ "oauth_discord_id oauth_discord_secret oauth_key oauth_token oauth2_secret oauth_secret oauth_client_secret oauth_client_id oauth_consumer_key oauth_consumer_secret " +
+		/* paypal */ "paypal_identity_token paypal_sandbox paypal_secret paypal_token paypal_client_secret paypal_api_username paypal_api_password paypal_api_signature " +
+		/* misc a */ "playbooks_url private_key private_signing_password queue_driver root_password sa_password send_keys preferred_username prebuild_auth plugin_password pring_mail_username " +
+		/* prod */ "prod_secret_key prod_password prod_access_key_id production_secret production_password production_key project_config publish_secret publish_key publish_access " +
+		/* parse */ "parse_js_key parse_rest_api_key passwordtravis pagerduty_apikey pagerduty_token pagerduty_service_key packagecloud_token plotly_apikey plotly_api_key " +
+		/* places */ "places_apikey places_api_key pg_host pg_database pg_password pg_user pg_port " +
+		/* percy */ "percy_token percy_project personal_secret personal_key pypi_passowrd pypi_password pypi_token postman_token " +
+		/* postgres */ "postgres_password postgresql_pass postgresql_db postgresql_password postgres_env_postgres_password postgres_env_postgres_db postgres_user postgres_host " +
+		/* redis */ "redis_host redis_password redis_port rediscloud_url redis_stunnel_urls response_auth_jwt_secret response_data_secret " +
+		/* sentry */ "sentry_dsn sentry_key sentry_secret sentry_endpoint sentry_default_org sentry_auth_token sentry_project " +
+		/* session */ "session_driver session_lifetime session_secret session_token session_key session_cookie_secret " +
+		/* sf/sendwithus */ "sf_username sendwithus_key ses_secret_key ses_access_key ses_smtp_password " +
+		/* service */ "service_account_secret service_account_key setsecretkey setdstsecretkey setdstaccesskey " +
+		/* scrutinizer */ "scrutinizer_token sdr_token sauce_access_key sauce_username " +
+		/* slack */ "slack_channel slack_incoming_webhook slack_key slack_outgoing_token slack_secret slack_signing_secret slack_token slack_url slack_webhook slack_webhook_url slack_bot_token slack_app_token " +
+		/* square */ "square_access_token square_apikey square_app square_app_id square_appid square_secret square_token square_reader_sdk_repository_password square_location_id squaresecret squaretoken " +
+		/* ssh */ "ssh2_auth_password sshkey sshpass ssmtp_config svn_pass svn_password " +
+		/* surge */ "surge_token surge_login " +
+		/* stormpath */ "stormpath_api_key_secret stormpath_api_key_id " +
+		/* strip/stripe */ "strip_key strip_secret strip_secret_token strip_token strip_secret_key strip_publishable_key stripe_key stripe_secret stripe_secret_token stripe_token stripe_public stripe_private stripe_publishable_key stripe_secret_key stripe_publishable stripe_pk_key stripe_sk_key stripsecret striptoken " +
+		/* token misc */ "token_twilio token_core_java token_secret token_key trusted_hosts twi_auth twi_sid " +
+		/* twilio */ "twilio_account_id twilio_account_secret twilio_account_sid twilio_accountsid twilio_api twilio_api_auth twilio_api_key twilio_api_secret twilio_api_token twilio_auth twilio_auth_token twilio_secret twilio_secret_token twilio_sid twilio_token twilioapiauth twilioapisecret twilioapisid twilioapitoken twilioauthtoken twiliosecret twiliotoken twilio_configuration_sid twilio_chat_account_api_service twilio_from_number twilio_account_phone_number twilioauthkey twilioauthsid twiliokey twiliosid " +
+		/* twitter */ "twitter_api_secret twitter_consumer_key twitter_consumer_secret twitter_key twitter_secret twitter_token twitteroauthaccesstoken twitteroauthaccesssecret twitter_access_token twitter_access_secret twitter_api_key twitterkey twittersecret " +
+		/* wordpress */ "wordpress_password wordpress_db_user wordpress_db_password wordpress_db_host wordpress_db_name wporg_password wpjm_phpunit_google_geocode_api_key wordpress_auth_key wordpress_logged_in_salt " +
+		/* z */ "zen_key zen_tkn zen_token zendesk_api_token zendesk_key zendesk_token zendesk_url zendesk_username zendesk_password zendesk_travis_github zensonatypepassword zhuliang_gh_token zopim_account_key " +
+		/* access */ "access_key access_token accesskey access_key_id access_secret access_token_secret account_sid accountsid account_id admin_pass admin_user admin_password admin_email admin_username accesskeyid accesstoken " +
+		/* api */ "api_key api_secret apikey api_token api_key_id api_secret_key app_key app_secret app_url app_id app_token application_id application_secret authsecret auth_token auth_secret auth_key auth_password authorization_token api_key_sid api_key_secret " +
+		/* aws */ "aws_secret_token aws_access aws_access_key_id aws_bucket aws_config aws_default_region aws_key aws_secret aws_secret_access_key aws_secret_key aws_token aws_session_token aws_region aws_s3_bucket aws_lambda_function awssecretkey awsaccesskeyid aws_secrets aws_config_secretaccesskey aws_config_accesskeyid aws_ses_secret_access_key aws_ses_access_key_id amazon_secret_access_key amazon_bucket_name " +
+		/* b-c */ "bucket_password client_secret cloudinary_api_key cloudinary_api_secret cloudinary_name cloudinary_url connectionstring connection_string consumer_secret consumer_key consumerkey " +
+		/* database */ "database_dialect database_host database_logging database_password database_schema database_schema_test database_url database_username database_port database_name db_database db_dialect db_host db_password db_port db_server db_username db_name db_pass db_user dbpasswd dbpassword dbuser db_pw db_connection " +
+		/* django */ "django_password django_secret_key django_debug " +
+		/* digitalocean */ "digitalocean_token digitalocean_access_token digitalocean_secret_key digitalocean_ssh_key_ids digitalocean_ssh_key_body " +
+		/* docker */ "docker_password docker_token docker_username docker_hub_token docker_pass docker_passwd dockerhubpassword dockerhub_password docker_postgres_url docker_key " +
+		/* elastic */ "elastic_host elastic_port elastic_prefix elasticsearch_password elasticsearch_secret elasticsearch_url elasticsearch_username elastic_cloud_auth " +
+		/* encrypt */ "encrypt_key encryption_key encryption_secret encryption_password decrypt_key decryption_key " +
+		/* facebook */ "facebook_app_secret facebook_secret facebook_client_secret facebook_access_token facebook_app_id fb_app_secret fb_id fb_secret fb_token fb_app_id " +
+		/* firebase */ "firebase_token firebase_api_key firebase_secret firebase_project_id firebase_database_url firebase_messaging_sender_id firebase_app_id firebase_key firebase_api_token firebase_api_json firebase_project_develop " +
+		/* fcm */ "fcm_server_key fcm_api_key " +
+		/* gatsby */ "gatsby_wordpress_base_url gatsby_wordpress_client_id gatsby_wordpress_client_secret gatsby_wordpress_password gatsby_wordpress_protocol gatsby_wordpress_user " +
+		/* github */ "github_id github_secret github_token github_tokens github_repo github_release_token github_pwd github_password github_oauth_token github_oauth github_key github_hunter_username github_hunter_token github_deployment_token github_deploy_hb_doc_pass github_client_secret github_auth_token github_auth github_api_token github_api_key github_access_token github_client_id github_email github_username github_user github_webhook_secret github_deploy_key github_npm_token ghb_token ghost_api_key " +
+		/* gitlab */ "gitlab_user_email gitlab_token gitlab_secret gitlab_client_id gitlab_client_secret " +
+		/* git */ "git_token git_name git_email git_committer_name git_committer_email git_password git_user git_username git_author_name git_author_email " +
+		/* gh next */ "gh_token gh_oauth_token gh_oauth_client_secret gh_repo_token gh_email gh_api_key gh_next_oauth_client_secret gh_next_unstable_oauth_client_secret gh_next_unstable_oauth_client_id gh_unstable_oauth_client_secret " +
+		/* gogs */ "gogs_password gogs_token " +
+		/* gradle */ "gradle_signing_password gradle_signing_key_id gradle_publish_secret gradle_publish_key gradle_release_key gradle_release_password " +
+		/* gren */ "gren_github_token grgit_user " +
+		/* hab */ "hab_key hab_auth_token " +
+		/* hb */ "hb_codesign_key_pass hb_codesign_gpg_pass " +
+		/* homebrew */ "homebrew_github_api_token " +
+		/* hockey */ "hockeyapp_token " +
+		/* hub */ "hub_dxia2_password hub_upload_password " +
+		/* internal */ "ij_repo_username ij_repo_password index_name internal_secrets internal_api_key integration_test_appid integration_test_api_key ios_docs_deploy_token itest_gh_token " +
+		/* jdbc */ "jdbc_mysql jdbc_host jdbc_databaseurl jdbc_password jdbc_user jdbc_url jdbc_connection_string " +
+		/* kafka */ "kafka_rest_url kafka_instance_name kafka_admin_url kafka_password kafka_username kafka_broker " +
+		/* k8s */ "kovan_private_key kubeconfig kubecfg_s3_path kubernetes_token k8s_secret " +
+		/* misc k */ "kxoltsn3vogdop92m " +
+		/* leanplum */ "leanplum_key " +
+		/* lektor */ "lektor_deploy_username lektor_deploy_password " +
+		/* lighthouse */ "lighthouse_api_key " +
+		/* linkedin */ "linkedin_client_secret linkedin_client_id " +
+		/* linux */ "linux_signing_key " +
+		/* ll */ "ll_shared_key ll_publish_url " +
+		/* looker */ "looker_test_runner_client_secret " +
+		/* lottie */ "lottie_upload_cert_key_store_password lottie_upload_cert_key_password lottie_s3_secret_key lottie_s3_api_key lottie_happo_secret_key lottie_happo_api_key " +
+		/* magento */ "magento_password magento_auth_username magento_auth_password " +
+		/* manage */ "manage_secret manage_key management_token managementapiaccesstoken " +
+		/* manifest */ "manifest_app_url manifest_app_token " +
+		/* mapbox */ "mapboxaccesstoken mapbox_aws_secret_access_key mapbox_aws_access_key_id mapbox_api_token mapbox_access_token " +
+		/* mg */ "mg_public_api_key mg_api_key " +
+		/* mh */ "mh_password mh_apikey " +
+		/* mile */ "mile_zero_key " +
+		/* minio */ "minio_secret_key minio_access_key " +
+		/* mistral */ "mistral_api_key " +
+		/* multi */ "multi_workspace_sid multi_workflow_sid multi_disconnect_sid multi_connect_sid multi_bob_sid " +
+		/* my */ "my_secret_env " +
+		/* native */ "nativeevents " +
+		/* netlify */ "netlify_api_key netlify_token " +
+		/* nexus */ "nexuspassword nexus_password " +
+		/* newrelic */ "new_relic_beta_token new_relic_license_key new_relic_api_key " +
+		/* ngrok */ "ngrok_token ngrok_auth_token " +
+		/* node */ "node_pre_gyp_secretaccesskey node_pre_gyp_github_token node_pre_gyp_accesskeyid node_env " +
+		/* npm */ "npm_token npm_secret_key npm_password npm_email npm_auth_token npm_api_token npm_api_key " +
+		/* numbers */ "numbers_service_pass " +
+		/* nuget */ "nuget_key nuget_apikey nuget_api_key " +
+		/* now */ "now_token non_token " +
+		/* object */ "object_store_creds object_store_bucket object_storage_region_name object_storage_password " +
+		/* oc */ "oc_pass " +
+		/* octest */ "octest_password octest_app_username octest_app_password " +
+		/* ofta */ "ofta_secret ofta_region ofta_key " +
+		/* okta */ "okta_oauth2_clientsecret okta_oauth2_client_secret okta_client_token okta_api_token " +
+		/* omise */ "omise_skey omise_pubkey omise_pkey omise_key omise_secret " +
+		/* onesignal */ "onesignal_user_auth_key onesignal_api_key " +
+		/* openwhisk */ "openwhisk_key open_whisk_key " +
+		/* ossrh */ "org_project_gradle_sonatype_nexus_password org_gradle_project_sonatype_nexus_password os_password os_auth_url ossrh_username ossrh_secret ossrh_password ossrh_pass ossrh_jira_password " +
+		/* misc q-r */ "quip_token qiita_token rabbitmq_password rabbitmq_user randrmusicapiaccesstoken razorpay_secret razorpay_key_id razorpay_key refresh_token registry_secure registry_pass registry_password release_token release_gh_token repotoken repo_token reporting_webdav_url reporting_webdav_pwd rest_api_key route53_access_key_id route53_secret_access_key rtd_store_pass rtd_key_pass rubygems_auth_token ropsten_private_key rinkeby_private_key " +
+		/* s3 */ "s3_user_secret s3_secret_key s3_secret_assets s3_secret_app_logs s3_key_assets s3_key_app_logs s3_key s3_external_3_amazonaws_com s3_bucket_name_assets s3_bucket_name_app_logs s3_access_key_id s3_access_key s3_bucket s3_secret s3_bucket_name " +
+		/* sacloud */ "sacloud_api sacloud_access_token_secret sacloud_access_token " +
+		/* salesforce */ "salesforce_bulk_test_security_token salesforce_bulk_test_password salesforce_password salesforce_token salesforce_client_id salesforce_client_secret " +
+		/* salt */ "salt_value " +
+		/* sandbox */ "sandbox_aws_secret_access_key sandbox_aws_access_key_id sandbox_access_token sandbox_secret sandbox_password sandbox_token " +
+		/* segment */ "secretkey secretaccesskey secret_key_base secret_question secret_token segment_api_key segment_token " +
+		/* selion */ "selion_selenium_host selion_log_level_dev " +
+		/* se misc */ "slash_developer_space_key slash_developer_space slate_user_email snyk_token snyk_api_token snoowrap_refresh_token snoowrap_password snoowrap_client_secret " +
+		/* sonar */ "sonar_token sonar_project_key sonar_organization_key sonar_login dsonar_projectkey dsonar_login " +
+		/* sonatype */ "sonatypepassword sonatype_token_user sonatype_token_password sonatype_password sonatype_pass sonatype_nexus_password sonatype_gpg_passphrase sonatype_gpg_key_name " +
+		/* socrata */ "socrata_password socrata_app_token " +
+		/* soundcloud */ "soundcloud_password soundcloud_client_secret " +
+		/* spaces */ "spaces_secret_access_key spaces_access_key_id spaces_key spaces_secret " +
+		/* spotify */ "spotify_api_client_secret spotify_api_access_token spotify_client_secret " +
+		/* sqs */ "sqssecretkey sqsaccesskey " +
+		/* srcclr */ "srcclr_api_token " +
+		/* starship */ "starship_auth_token starship_account_sid " +
+		/* star test */ "star_test_secret_access_key star_test_location star_test_bucket star_test_aws_access_key_id " +
+		/* staging */ "staging_base_url_runscope " +
+		/* telegram */ "telegram_bot_token telegram_token " +
+		/* thera */ "thera_oss_access_key " +
+		/* tester */ "tester_keys_password test_test test_github_token tesco_api_key " +
+		/* trex */ "trex_okta_client_token trex_client_token " +
+		/* travis */ "travis_token travis_secure_env_vars travis_pull_request travis_gh_token travis_e2e_token travis_com_token travis_branch travis_api_token travis_access_token " +
+		/* unity */ "unity_serial unity_password " +
+		/* urban */ "urban_secret urban_master_secret urban_key " +
+		/* user */ "use_ssh usertravis user_assets_secret_access_key user_assets_access_key_id us_east_1_elb_amazonaws_com " +
+		/* v misc */ "v_sfdc_password v_sfdc_client_secret vercel_token virustotal_apikey virustotal_api_key visual_recognition_api_key " +
+		/* vip */ "vip_github_deploy_key_pass vip_github_deploy_key vip_github_build_repo_deploy_key " +
+		/* vsc */ "vscetoken " +
+		/* w misc */ "wakatime_api_key watson_password watson_device_password watson_conversation_password webhook_secret webhook_token widget_test_server wincert_password www_googleapis_com " +
+		/* yangshun */ "yangshun_gh_token yangshun_gh_password " +
+		/* yt */ "yt_server_api_key yt_partner_refresh_token yt_partner_client_secret yt_client_secret yt_api_key yt_account_refresh_token yt_account_client_secret " +
+		/* ftp */ "ftp_username ftp_user ftp_pw ftp_password ftp_login ftp_host " +
+		/* fossa/flickr/flask */ "fossa_api_key flickr_api_secret flickr_api_key flask_secret_key firefox_secret " +
+		/* file/exp/eureka/env */ "file_password exp_password eureka_awssecretkey env_sonatype_password env_secret_access_key env_secret env_key env_heroku_api_key env_github_oauth_token " +
+		/* end user */ "end_user_password " +
+		/* gcs/gcr/gcloud */ "gcs_bucket gcr_password gcloud_service_key gcloud_project gcloud_bucket " +
+		/* danger/cypress/coverity/coveralls */ "danger_github_api_token cypress_record_key coverity_scan_token coveralls_token coveralls_repo_token coveralls_api_token " +
+		/* cos/conversation/contentful */ "cos_secrets conversation_username conversation_password contentful_v2_access_token contentful_test_org_cma_token contentful_php_management_test_token contentful_management_api_access_token_new contentful_management_api_access_token contentful_integration_management_token contentful_cma_test_token contentful_access_token " +
+		/* conekta/coding/codecov/codeclimate/codacy */ "conekta_apikey coding_token codecov_token codeclimate_repo_token codacy_project_token " +
+		/* cocoapods */ "cocoapods_trunk_token cocoapods_trunk_email " +
+		/* cn/clu */ "cn_secret_access_key cn_access_key_id clu_ssh_private_key_base64 clu_repo_url " +
+		/* cloudinary staging */ "cloudinary_url_staging " +
+		/* cloudflare extra */ "cloudflare_email cloudflare_auth_email " +
+		/* cloudant */ "cloudant_service_database cloudant_processed_database cloudant_password cloudant_parsed_database cloudant_order_database cloudant_instance cloudant_database cloudant_audited_database cloudant_archived_database " +
+		/* cloud/clojars */ "cloud_api_key clojars_password " +
+		/* cli/claimr */ "cli_e2e_cma_token claimr_token claimr_superuser claimr_db claimr_database " +
+		/* ci */ "ci_user_token ci_server_name ci_registry_user ci_project_url ci_deploy_password " +
+		/* chrome/cheverny/cf/certificate/censys */ "chrome_refresh_token chrome_client_secret cheverny_token cf_password certificate_password censys_secret " +
+		/* cattle/cargo/cache */ "cattle_secret_key cattle_agent_instance_auth cattle_access_key cargo_token cache_s3_secret_key " +
+		/* bx/bundlesize/built/bucketeer */ "bx_username bx_password bundlesize_github_token built_branch_deploy_key bucketeer_aws_secret_access_key bucketeer_aws_access_key_id " +
+		/* brackets/bluemix/bintray/b2 */ "brackets_repo_oauth_token bluemix_username bluemix_pwd bluemix_password bluemix_pass_prod bluemix_pass bluemix_auth bluemix_api_key bintraykey bintray_token bintray_key bintray_gpg_password bintray_apikey b2_bucket b2_app_key " +
+		/* awscn */ "awscn_secret_access_key awscn_access_key_id " +
+		/* author/apple/appclientsecret/app extra */ "author_npm_api_key author_email_addr apple_id_password appclientsecret app_secrete app_report_token_key app_bucket_perm " +
+		/* apigw/apiary */ "apigw_access_token apiary_api_key " +
+		/* aos/ansible/android/anaconda */ "aos_sec aos_key ansible_vault_password android_docs_deploy_token anaconda_token " +
+		/* alicloud/alias/algolia extra/adzerk */ "alicloud_secret_key alicloud_access_key alias_pass algolia_search_key_1 algolia_search_key algolia_search_api_key algolia_api_key_search algolia_api_key_mcm algolia_admin_key_mcm algolia_admin_key_2 algolia_admin_key_1 adzerk_api_key " +
+		/* droplet/dropbox/doordash */ "droplet_travis_password dropbox_oauth_bearer doordash_auth_token " +
+		/* generic */ "password passwd pwd passphrase credentials credential userpass secret token key " +
+		/* env */ "env_secret env_key env_token api_secret_key auth_secret_key"
+
+	// Build list: plain keywords → regex form, dedupe
+	list := make([]string, 0, 700)
+	uniq := make(map[string]bool)
+
+	for _, k := range strings.Fields(blob) {
+		// convert "_" to character class [_-]? to match both yaml "_" and "-" variants
+		r := strings.ReplaceAll(k, "_", "[_-]?")
+		// handle camelCase too (e.g., accessToken → optional case-insensitive)
+		if !uniq[r] {
+			uniq[r] = true
+			list = append(list, r)
+		}
+	}
+	for _, s := range specials {
+		if !uniq[s] {
+			uniq[s] = true
+			list = append(list, s)
+		}
+	}
+
+	// group by first letter → 1 mega regex per letter (fast + clean)
+	buckets := make(map[string][]string)
+	for _, k := range list {
+		c := strings.ToLower(k[:1])
+		buckets[c] = append(buckets[c], k)
+	}
+
+	letters := make([]string, 0, len(buckets))
+	for c := range buckets {
+		letters = append(letters, c)
+	}
+	sort.Strings(letters)
+
+	for _, c := range letters {
+		kws := buckets[c]
+		// longest-first: "secret_key_base" must win over "secret"
+		sort.Slice(kws, func(i, j int) bool {
+			return len(kws[i]) > len(kws[j])
+		})
+		re := `(?i)["']?(?:` + strings.Join(kws, "|") + `)["']*\s*(?:=>|[:=])\s*["']?([^\s"'\r\n<>,;\\]{1,60})`
+		comp, err := regexp.Compile(re)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] keyword bucket '%s': %v\n", c, err)
+			continue
+		}
+		patterns = append(patterns, Pattern{
+			Name:    "Credential Assignment [" + strings.ToUpper(c) + "]",
+			Re:      comp,
+			Keyword: true,
+		})
 	}
 }
 
-func req(url string) {
-	if !strings.Contains(url, "http") {
-		if !*silent {
-			fmt.Println("\033[31m[-]\033[37m Send URLs via stdin (ex: cat js.txt | mantra). Each url must contain 'http' string.")
+// ═══════════════════════════════════════════════════════════════════════════════
+//  EXTRA REGEX LOADER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func loadExtraPatterns(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] cannot open extra regex file: %v\n", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	count := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
 		}
-		os.Exit(0)
+		compiled, err := regexp.Compile(line)
+		if err != nil {
+			l := len(line)
+			if l > 60 {
+				l = 60
+			}
+			fmt.Fprintf(os.Stderr, "[!] skipping invalid regex: %s...\n", line[:l])
+			continue
+		}
+		patterns = append(patterns, Pattern{
+			Name:   "Custom",
+			Re:     compiled,
+			Custom: true,
+		})
+		count++
+	}
+	if !*silentFlag {
+		nc := !*noColorFlag
+		fmt.Printf("%s loaded %d custom patterns from %s\n",
+			colorize(nc, C_BGRN, "[+]"), count, path)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  REPORTING —  [+] URL [match]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func report(rawURL, typ, match string) {
+	key := cleanMatch(match)
+	if key == "" {
+		return
 	}
 
-	patterns := initializePatterns()
+	// global dedup — same secret only printed once
+	cacheKey := typ + "|" + key
+	if _, dup := seen.LoadOrStore(cacheKey, struct{}{}); dup {
+		atomic.AddInt64(&st.Dupes, 1)
+		return
+	}
+	atomic.AddInt64(&st.Found, 1)
 
-	defer func() {
-		if r := recover(); r != nil {
+	nc := !*noColorFlag
+	fmt.Printf("%s %s %s\n",
+		colorize(nc, C_BGRN, "[+]"),
+		rawURL,
+		colorize(nc, C_BCYN, "["+key+"]"))
+
+	if outFile != nil {
+		fmt.Fprintf(outFile, "[+] %s [%s]\n", rawURL, key)
+	}
+	if jsonOut != nil {
+		f := Finding{URL: rawURL, Type: typ, Match: key}
+		b, _ := json.Marshal(f)
+		fmt.Fprintln(jsonOut, string(b))
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SCANNING ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func scanBody(body string, rawURL string) {
+	bodyLen := int64(len(body))
+	atomic.AddInt64(&st.Bytes, bodyLen)
+
+	for i := range patterns {
+		p := &patterns[i]
+		matches := p.Re.FindAllStringSubmatch(body, *maxMatchFlag)
+
+		for _, m := range matches {
+			full := m[0]
+			val := full
+
+			// use capture group if available (for keyword=value patterns)
+			if len(m) > 1 && m[1] != "" {
+				val = m[1]
+			}
+
+			// false positive check
+			if p.Keyword || p.Custom {
+				if isFPKeyword(val, *entropyFlag) {
+					continue
+				}
+			} else {
+				if isFPValue(val, *entropyFlag) {
+					continue
+				}
+			}
+
+			report(rawURL, p.Name, full)
+		}
+	}
+}
+
+func fetchURL(rawURL string, client *http.Client, headers map[string]string) {
+	// normalize URL
+	if !strings.HasPrefix(rawURL, "http") {
+		rawURL = "https://" + rawURL
+	}
+
+	atomic.AddInt64(&st.Requests, 1)
+
+	for attempt := 0; attempt <= *retryFlag; attempt++ {
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
 			return
 		}
-	}()
 
-	transp := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	httpclient := &http.Client{
-		Transport: transp,
-		Timeout:   10 * time.Second,
-	}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return
-	}
-
-	req.Header.Set("User-Agent", *ua)
-	if len(*rc) > 0 {
-		req.Header.Set("Cookie", *rc)
-	}
-
-	if *detailed {
-		fmt.Printf("\033[33m[*]\033[37m Processing: %s\n", url)
-	}
-
-	r, err := httpclient.Do(req)
-	if err != nil {
-		if *detailed {
-			fmt.Printf("\033[31m[-]\033[37m Error: %s - %v\n", url, err)
+		// set headers
+		req.Header.Set("User-Agent", *uaFlag)
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Encoding", "identity")
+		req.Header.Set("Connection", "keep-alive")
+		for k, v := range headers {
+			req.Header.Set(k, v)
 		}
-		return
-	}
-	defer r.Body.Close()
 
-	// Update stats
-	stats.mu.Lock()
-	stats.URLsProcessed++
-	stats.mu.Unlock()
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	strbody := string(body)
-	findings := analyzeContent(strbody, patterns, *extrapattern)
-
-	// Update stats
-	if len(findings) > 0 {
-		stats.mu.Lock()
-		stats.SecretsFound += len(findings)
-		stats.mu.Unlock()
-	}
-
-	// Display findings
-	for _, finding := range findings {
-		sevColor := getSeverityColor(finding["severity"])
-
-		if *detailed {
-			fmt.Printf("%s[+]\033[37m %s\n", sevColor, url)
-			fmt.Printf("    \033[37mSecret: \033[1;37m%s\033[0m\n", finding["secret"])
-			fmt.Printf("    \033[37mType: \033[36m%s\033[0m\n", finding["type"])
-			fmt.Printf("    \033[37mCategory: \033[35m%s\033[0m\n", finding["category"])
-			fmt.Printf("    \033[37mSeverity: %s%s\033[0m\n", sevColor, finding["severity"])
-			fmt.Printf("    \033[37mLine: \033[33m%s\033[0m\n\n", finding["line"])
-		} else {
-			if finding["severity"] == "CUSTOM" {
-				fmt.Printf("%s[+]\033[37m %s %s[\033[37m%s%s]\033[37m [\033[36m%s\033[37m] \033[33m[CUSTOM PATTERN]\033[0m\n",
-					sevColor,
-					url,
-					sevColor,
-					truncateSecret(finding["secret"]),
-					sevColor,
-					finding["type"])
-			} else {
-				fmt.Printf("%s[+]\033[37m %s %s[\033[37m%s%s]\033[37m [\033[36m%s\033[37m] [\033[35m%s\033[37m]\033[0m\n",
-					sevColor,
-					url,
-					sevColor,
-					truncateSecret(finding["secret"]),
-					sevColor,
-					finding["type"],
-					finding["severity"])
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == *retryFlag {
+				atomic.AddInt64(&st.Errors, 1)
 			}
+			continue
 		}
+
+		// read body with size limit
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(*maxBodyFlag)*1024*1024))
+		resp.Body.Close()
+
+		atomic.AddInt64(&st.URLs, 1)
+		scanBody(string(body), rawURL)
+		return
 	}
 }
 
-// truncateSecret truncates long secrets for display
-func truncateSecret(s string) string {
-	if len(s) > 60 {
-		return s[:30] + "..." + s[len(s)-20:]
+func worker(jobs <-chan string, client *http.Client, headers map[string]string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for u := range jobs {
+		fetchURL(u, client, headers)
 	}
-	return s
 }
 
-func init() {
-	silent = flag.Bool("s", false, "silent mode (no banner)")
-	thread = flag.Int("t", 50, "number of concurrent threads")
-	ua = flag.String("ua", "Mantra/1.0 Security Scanner", "User-Agent header")
-	detailed = flag.Bool("d", false, "detailed output with full information")
-	rc = flag.String("c", "", "cookies to include in requests")
-	extrapattern = flag.String("ep", "", "extra custom regex pattern")
-	minEntropy = flag.Float64("me", 3.5, "minimum entropy threshold (0-8)")
-	noEntropy = flag.Bool("ne", false, "disable entropy checking (more results)")
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SUMMARY
+// ═══════════════════════════════════════════════════════════════════════════════
 
-func banner() {
-	fmt.Printf("\033[31m" + `
-░█▀▄░█▀▀░█░█░█▀▀░█▀█░█░░░█░█░█▀▀░█░█░█▀▀
-░█▀▄░█▀▀░▀▄▀░█▀▀░█▀█░█░░░█▀▄░█▀▀░░█░░▀▀█ ─ VERSION 1.1
-░▀░▀░▀▀▀░░▀░░▀▀▀░▀░▀░▀▀▀░▀░▀░▀▀▀░░▀░░▀▀▀
-` + "\033[0m")
-	fmt.Printf("\033[36m  	DEVELOPMENT By: INTELEON404 \033[37m\n")
-}
-
-func printStats() {
-	elapsed := time.Since(stats.StartTime)
-	fmt.Println("\n\033[36m" + strings.Repeat("═", 68) + "\033[0m")
-	fmt.Printf("\033[1;32m                    SCAN COMPLETE\033[0m\n")
-	fmt.Println("\033[36m" + strings.Repeat("═", 68) + "\033[0m")
-	fmt.Printf("\033[37m  URLs Processed: \033[1;36m%d\033[0m\n", stats.URLsProcessed)
-	fmt.Printf("\033[37m  Secrets Found:  \033[1;32m%d\033[0m\n", stats.SecretsFound)
-	fmt.Printf("\033[37m  Time Elapsed:   \033[1;33m%s\033[0m\n", elapsed.Round(time.Second))
-	if stats.URLsProcessed > 0 {
-		fmt.Printf("\033[37m  Avg Speed:      \033[1;35m%.2f URLs/sec\033[0m\n",
-			float64(stats.URLsProcessed)/elapsed.Seconds())
+func printSummary() {
+	if *silentFlag {
+		return
 	}
-	fmt.Println("\033[36m" + strings.Repeat("═", 68) + "\033[0m")
-	fmt.Printf("\033[32m  Happy Hunting! 🎯\033[0m\n\n")
+	nc := !*noColorFlag
+	elapsed := time.Since(start).Round(time.Millisecond)
+
+	g := colorize(nc, C_BGRN, "[+]")
+
+	fmt.Println()
+	fmt.Printf("%s Scan Complete in %s\n", g, elapsed)
+
+	// basic stats line
+	line := fmt.Sprintf("%s URLs: %d | Findings: %d | Skipped: %d",
+		g,
+		atomic.LoadInt64(&st.URLs),
+		atomic.LoadInt64(&st.Found),
+		atomic.LoadInt64(&st.Dupes))
+
+	if e := atomic.LoadInt64(&st.Errors); e > 0 {
+		line += fmt.Sprintf(" | Errors: %d", e)
+	}
+	fmt.Println(line)
+
+	// detailed stats (with -stats flag)
+	if *showStatsFlag {
+		b := atomic.LoadInt64(&st.Bytes)
+		r := atomic.LoadInt64(&st.Requests)
+		fmt.Printf("%s Requests: %d | Data: %s | Patterns: %d\n",
+			g, r, humanBytes(b), len(patterns))
+	}
 }
+
+// humanBytes formats bytes to human readable
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAIN
+// ═══════════════════════════════════════════════════════════════════════════════
 
 func main() {
+	flag.Usage = printUsage
 	flag.Parse()
 
-	stats.StartTime = time.Now()
+	// ─── initialize patterns ───
+	patterns = make([]Pattern, 0, 700)
+	initStructuredPatterns()
+	buildKeywordPatterns()
 
-	if !*silent {
-		banner()
+	if *extraFlag != "" {
+		loadExtraPatterns(*extraFlag)
 	}
 
-	stdin := bufio.NewScanner(os.Stdin)
-	urls := make(chan string, *thread*2)
-	var wg sync.WaitGroup
+	// ─── print banner ───
+	printBanner()
 
-	// Start workers
-	for i := 0; i < *thread; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for url := range urls {
-				req(url)
-			}
-		}()
-	}
-
-	// Read URLs from stdin
-	go func() {
-		for stdin.Scan() {
-			url := strings.TrimSpace(stdin.Text())
-			if url != "" {
-				urls <- url
-			}
+	// ─── parse custom headers ───
+	headers := make(map[string]string)
+	if *headerFlag != "" {
+		parts := strings.SplitN(*headerFlag, ":", 2)
+		if len(parts) == 2 {
+			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
-		close(urls)
+	}
+
+	// ─── HTTP client setup ───
+	transport := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: !*verifyTLSFlag},
+		MaxIdleConns:          300,
+		MaxIdleConnsPerHost:   30,
+		IdleConnTimeout:       30 * time.Second,
+		DisableKeepAlives:     false,
+		ResponseHeaderTimeout: time.Duration(*timeoutFlag) * time.Second,
+	}
+
+	// proxy support
+	if *proxyFlag != "" {
+		proxyURL, err := url.Parse(*proxyFlag)
+		if err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		} else {
+			fmt.Fprintf(os.Stderr, "[!] invalid proxy URL: %v\n", err)
+		}
+	}
+
+	client := &http.Client{
+		Timeout:   time.Duration(*timeoutFlag) * time.Second,
+		Transport: transport,
+	}
+
+	// ─── output files ───
+	if *outputFlag != "" {
+		f, err := os.OpenFile(*outputFlag, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err == nil {
+			outFile = f
+			defer outFile.Close()
+		} else {
+			fmt.Fprintf(os.Stderr, "[!] cannot open output file: %v\n", err)
+		}
+	}
+
+	if *jsonFlag != "" {
+		f, err := os.OpenFile(*jsonFlag, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err == nil {
+			jsonOut = f
+			defer jsonOut.Close()
+		} else {
+			fmt.Fprintf(os.Stderr, "[!] cannot open JSON output file: %v\n", err)
+		}
+	}
+
+	// ─── signal handling (Ctrl+C → graceful summary) ───
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	start = time.Now()
+
+	go func() {
+		<-sig
+		printSummary()
+		os.Exit(0)
 	}()
 
-	// Wait for completion
-	wg.Wait()
+	// ─── worker pool ───
+	jobs := make(chan string, 500)
+	var wg sync.WaitGroup
 
-	// Print statistics
-	if !*silent {
-		printStats()
+	for i := 0; i < *threadsFlag; i++ {
+		wg.Add(1)
+		go worker(jobs, client, headers, &wg)
 	}
+
+	// ─── input reader ───
+	sc := bufio.NewScanner(os.Stdin)
+	if *listFlag != "" {
+		f, err := os.Open(*listFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] cannot open input file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		sc = bufio.NewScanner(f)
+	}
+	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	go func() {
+		for sc.Scan() {
+			u := strings.TrimSpace(sc.Text())
+			if u != "" && !strings.HasPrefix(u, "#") {
+				jobs <- u
+			}
+		}
+		close(jobs)
+	}()
+
+	// ─── wait & summarize ───
+	wg.Wait()
+	printSummary()
 }
